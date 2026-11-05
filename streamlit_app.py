@@ -26,7 +26,11 @@ import urllib3
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
-import pandas as pd
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except Exception:
+    HAS_PANDAS = False
 
 # Optional pypdf for reading internal PDF metadata
 try:
@@ -581,6 +585,7 @@ class WebDownloader:
 
 def build_zip_on_disk(downloaded_files, records, output_zip_path: Path, folder_name: str = "harvested_pdfs") -> None:
     """Builds the ZIP bundle directly on disk to prevent RAM usage on Streamlit Cloud."""
+    output_zip_path.parent.mkdir(parents=True, exist_ok=True)
     clean_folder = safe_folder_name(folder_name)
     with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename, local_path, _ in downloaded_files:
@@ -946,6 +951,13 @@ if start_btn:
 
 # 4. PERSISTENT RESULTS & SELECTION CONTROLS (Survives button clicks and app reruns)
 if st.session_state.get("raw_harvest"):
+    temp_dir_str = st.session_state.get("session_temp_dir")
+    # If container rebooted and wiped /tmp, reset stale session gracefully without crashing
+    if not temp_dir_str or not Path(temp_dir_str).exists():
+        st.session_state["raw_harvest"] = None
+        st.session_state["session_temp_dir"] = None
+        st.session_state["cached_zip_key"] = None
+        st.rerun()
     harvest = st.session_state["raw_harvest"]
     downloaded_count = harvest["downloaded_count"]
     failed_count = harvest["failed_count"]
@@ -1035,10 +1047,10 @@ if st.session_state.get("raw_harvest"):
                     "Publisher / Source": rec.publisher or "—",
                 })
 
-        df = pd.DataFrame(doc_list)
         editor_key = f"manifest_editor_{st.session_state.get('editor_version', 0)}"
+        table_data = pd.DataFrame(doc_list) if HAS_PANDAS else doc_list
         edited_df = st.data_editor(
-            df,
+            table_data,
             column_config={
                 "Keep": st.column_config.CheckboxColumn("Keep", default=True, help="Check to include in ZIP bundle"),
             },
@@ -1048,8 +1060,15 @@ if st.session_state.get("raw_harvest"):
             key=editor_key,
         )
 
-        # Sync user checkbox edits back to session state
-        kept_filenames = set(edited_df[edited_df["Keep"] == True]["File Name"])
+        # Sync user checkbox edits back to session state safely
+        if HAS_PANDAS and hasattr(edited_df, "to_dict"):
+            table_rows = edited_df.to_dict(orient="records")
+        elif isinstance(edited_df, list):
+            table_rows = edited_df
+        else:
+            table_rows = doc_list
+
+        kept_filenames = {r["File Name"] for r in table_rows if r.get("Keep", True)}
         for f, _, _ in downloaded_files:
             st.session_state["selected_filenames"][f] = (f in kept_filenames)
 
