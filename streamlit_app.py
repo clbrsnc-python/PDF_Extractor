@@ -15,6 +15,7 @@ import time
 import zipfile
 import tempfile
 import shutil
+import gc
 from collections import deque
 from dataclasses import dataclass
 from html import unescape
@@ -265,6 +266,12 @@ class WebDownloader:
                     self.process_dspace(soup, response.url, queue, depth)
                 else:
                     self.process_generic(soup, response.url, queue, depth)
+
+                response.close()
+                del response
+                del soup
+                if len(self.visited) % 10 == 0:
+                    gc.collect()
 
             except Exception as exc:
                 self.log(f"⚠️ Could not load `{url}`: {exc}")
@@ -572,10 +579,10 @@ class WebDownloader:
             self.log(f"❌ Failed `{filename}`: {exc}")
 
 
-def build_zip_in_memory(downloaded_files, records, folder_name: str = "harvested_pdfs") -> bytes:
+def build_zip_on_disk(downloaded_files, records, output_zip_path: Path, folder_name: str = "harvested_pdfs") -> None:
+    """Builds the ZIP bundle directly on disk to prevent RAM usage on Streamlit Cloud."""
     clean_folder = safe_folder_name(folder_name)
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(output_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename, local_path, _ in downloaded_files:
             try:
                 if local_path.exists():
@@ -594,8 +601,6 @@ def build_zip_in_memory(downloaded_files, records, folder_name: str = "harvested
         for rec in records:
             writer.writerow(rec.__dict__)
         zf.writestr(f"{clean_folder}/metadata.csv", ("\ufeff" + csv_buf.getvalue()).encode("utf-8"))
-
-    return zip_buffer.getvalue()
 
 
 # -------------------------------------------------------------
@@ -1059,18 +1064,28 @@ if st.session_state.get("raw_harvest"):
 
         st.write("")
 
-        # 3. Only the keep selected will be downloaded along with metadata
+        # 3. Stream ZIP directly from disk without consuming RAM
         if selected_files:
-            zip_data = build_zip_in_memory(selected_files, selected_records, folder_name=clean_name)
-            st.download_button(
-                label=f"📥 Download {len(selected_files)} Selected PDFs + Metadata (ZIP)",
-                data=zip_data,
-                file_name=f"{clean_name}.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True,
-                key="download_harvested_zip_btn",
-            )
+            cache_key = (clean_name, tuple(sorted(kept_filenames)))
+            zip_file_path = Path(st.session_state["session_temp_dir"]) / f"{clean_name}.zip"
+
+            # Rebuild on disk ONLY if the selection or folder name changed
+            if st.session_state.get("cached_zip_key") != cache_key or not zip_file_path.exists():
+                build_zip_on_disk(selected_files, selected_records, zip_file_path, folder_name=clean_name)
+                st.session_state["cached_zip_key"] = cache_key
+                gc.collect()
+
+            # Stream directly from disk using file binary reader
+            with open(zip_file_path, "rb") as zip_stream:
+                st.download_button(
+                    label=f"📥 Download {len(selected_files)} Selected PDFs + Metadata (ZIP • {size_str})",
+                    data=zip_stream,
+                    file_name=f"{clean_name}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                    key="download_harvested_zip_btn",
+                )
         else:
             st.warning("⚠️ No documents selected. Please check at least one document to enable ZIP download.")
     else:
