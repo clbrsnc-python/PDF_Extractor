@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Universal Bulk PDF Extractor - Streamlit Web App
--------------------------------------------------
-Streamlined, highlighted interface with compact colorful badges.
+Universal PDF Extractor - Streamlit Web App
+-------------------------------------------
+Clean, mobile-optimized interface with golden/white typography,
+inline crawler settings, and immediate result placement above feature tiles.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ try:
 except Exception:
     HAS_PYPDF = False
 
-# Suppress insecure SSL warnings for government/educational portals
+# Suppress insecure SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 USER_AGENT = (
@@ -266,7 +267,6 @@ class WebDownloader:
                     queue.append((child_url, depth + 1))
 
     def extract_generic_page_metadata(self, soup: BeautifulSoup, page_url: str) -> dict:
-        """Extracts Dublin Core, OpenGraph, and standard meta tags from standalone pages."""
         meta = {}
         meta["title"] = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
         meta["publisher"] = urlparse(page_url).netloc
@@ -295,7 +295,7 @@ class WebDownloader:
     def process_generic(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
         page_meta = self.extract_generic_page_metadata(soup, page_url)
 
-        # 1. Parse tables: extract title, date, and PDF link from rows
+        # Parse tables: extract title, date, and PDF link
         for table in soup.find_all("table"):
             headers = [clean_text(th.get_text(" ", strip=True)).lower() for th in table.find_all("th")]
             date_col_idx = -1
@@ -324,7 +324,7 @@ class WebDownloader:
 
                             self.download_pdf(href, filename, page_url, meta=row_meta, page_title=title)
 
-        # 2. Parse any direct PDF links outside tables
+        # Parse any direct PDF links outside tables
         for a in soup.find_all("a", href=True):
             href = urljoin(page_url, a["href"])
             u = urlparse(href)
@@ -337,7 +337,7 @@ class WebDownloader:
                 link_meta["title"] = raw_name or link_meta.get("title", filename)
                 self.download_pdf(href, filename, page_url, meta=link_meta, page_title=link_meta["title"])
 
-        # 3. Follow subpages within depth limit
+        # Follow subpages within depth limit
         if depth < self.max_depth:
             for a in soup.find_all("a", href=True):
                 href = canonical(urljoin(page_url, a["href"]))
@@ -485,7 +485,7 @@ class WebDownloader:
                 target_path.unlink(missing_ok=True)
                 raise ValueError(f"Content is not a PDF (content-type: '{content_type or 'unknown'}')")
 
-            # Extract internal PDF metadata to fill in missing fields (author, date, subject)
+            # Extract internal PDF metadata to fill in missing fields
             pdf_internal_meta = extract_pdf_file_metadata(target_path)
             for k, v in pdf_internal_meta.items():
                 if not meta.get(k) and v:
@@ -555,7 +555,7 @@ def build_zip_in_memory(downloaded_files, records) -> bytes:
 # Streamlit UI Configuration
 # -------------------------------------------------------------
 st.set_page_config(
-    page_title="Bulk PDF Extractor System",
+    page_title="PDF Extractor",
     page_icon="🎓",
     layout="wide",
 )
@@ -564,61 +564,63 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cinzel:wght@700;800&display=swap');
 
     .stApp {
         background: #f4f7fb;
         font-family: 'Plus Jakarta Sans', sans-serif;
     }
 
-    /* Main Academic Header */
+    /* Main Header Card with Golden & White Typography */
     .system-header-card {
         background: linear-gradient(135deg, #021a44 0%, #082d6c 60%, #031e50 100%);
         border-bottom: 3px solid #d4af37;
         border-radius: 14px;
-        padding: 20px 26px;
+        padding: 18px 24px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 22px;
+        margin-bottom: 18px;
         box-shadow: 0 6px 20px rgba(2, 26, 68, 0.12);
     }
     .system-header-left {
         display: flex;
         align-items: center;
-        gap: 16px;
+        gap: 14px;
     }
     .system-header-icon {
         background: #1e40af;
-        border: 2px solid #60a5fa;
-        color: white;
-        width: 48px;
-        height: 48px;
+        border: 2px solid #d4af37;
+        color: #ffd700;
+        width: 46px;
+        height: 46px;
         border-radius: 12px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 26px;
+        font-size: 24px;
         box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
+    /* Title: PDF Extractor in Golden / White */
     .system-title {
-        font-size: 24px;
+        font-family: 'Cinzel', serif;
+        font-size: 28px;
         font-weight: 800;
-        color: #ffffff;
+        color: #f7d784;
         margin: 0;
-        letter-spacing: 0.3px;
+        letter-spacing: 1px;
     }
     .system-subtitle {
         font-size: 13px;
         font-weight: 500;
-        color: #bfdbfe;
+        color: #ffffff;
         margin: 0;
         letter-spacing: 0.4px;
     }
     .system-badge-right {
         background: rgba(255, 255, 255, 0.12);
-        border: 1px solid rgba(255, 255, 255, 0.25);
-        color: #fef08a;
+        border: 1px solid rgba(212, 175, 55, 0.5);
+        color: #ffd700;
         font-weight: 700;
         font-size: 13px;
         padding: 6px 14px;
@@ -629,54 +631,67 @@ st.markdown(
     .highlighted-input-box {
         background: #ffffff;
         border: 2px solid #2563eb;
-        border-radius: 16px;
-        padding: 24px 26px;
-        margin-bottom: 20px;
-        box-shadow: 0 10px 28px rgba(37, 99, 235, 0.12);
-        position: relative;
+        border-radius: 14px;
+        padding: 18px 20px 14px 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.08);
     }
     .input-label-highlight {
-        font-size: 18px;
+        font-size: 16px;
         font-weight: 800;
         color: #0f172a;
+        margin-bottom: 10px;
         display: flex;
         align-items: center;
         gap: 8px;
-        margin-bottom: 8px;
-    }
-    .input-sub-tip {
-        font-size: 13px;
-        color: #64748b;
-        margin-bottom: 14px;
     }
 
-    /* COMPACT COLORFUL FEATURE TILES (Reduced Size, No Arrows) */
+    /* Highlighting text input with soft tint and blinking cursor */
+    .stTextInput > div > div > input {
+        background-color: #f8faff !important;
+        border: 1.5px solid #3b82f6 !important;
+        border-radius: 8px !important;
+        font-size: 15px !important;
+        color: #0f172a !important;
+        caret-color: #1d4ed8 !important;
+        padding: 10px 14px !important;
+        box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+        animation: cursorBlink 1s infinite;
+    }
+    .stTextInput > div > div > input:focus {
+        border-color: #1d4ed8 !important;
+        background-color: #ffffff !important;
+        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15) !important;
+    }
+
+    /* COMPACT COLORFUL STATUS TILES (Reduced Size, No Arrows) */
     .compact-tile {
-        border-radius: 10px;
-        padding: 10px 12px;
+        border-radius: 8px;
+        padding: 8px 10px;
         text-align: center;
         height: 100%;
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 10px;
-        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
-        margin-bottom: 20px;
+        gap: 8px;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+        margin-top: 14px;
+        margin-bottom: 14px;
     }
     .tile-icon {
-        font-size: 18px;
+        font-size: 16px;
         line-height: 1;
     }
     .tile-text-wrap {
         text-align: left;
     }
     .tile-title {
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 800;
         line-height: 1.2;
     }
     .tile-desc {
-        font-size: 10px;
+        font-size: 9px;
         font-weight: 600;
         line-height: 1.1;
     }
@@ -697,81 +712,169 @@ st.markdown(
     .tile-teal { background: #ccfbf1; border: 1px solid #99f6e4; color: #0f766e; }
     .tile-teal .tile-desc { color: #0d9488; }
 
-    /* Footer Banner */
+    /* Footer */
     .omni-footer {
         background: #02163b;
         color: #ffd54f;
         text-align: center;
-        padding: 10px;
-        border-radius: 8px;
+        padding: 8px;
+        border-radius: 6px;
         font-style: italic;
-        font-size: 14px;
+        font-size: 13px;
         letter-spacing: 0.8px;
-        margin-top: 26px;
+        margin-top: 20px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# 1. Main System Header (Starts directly with Bulk PDF Extractor System)
+# 1. Header: PDF Extractor (Golden / White font)
 st.markdown(
     """
     <div class="system-header-card">
         <div class="system-header-left">
             <div class="system-header-icon">🎓</div>
             <div>
-                <h1 class="system-title">Bulk PDF Extractor System</h1>
+                <h1 class="system-title">PDF Extractor</h1>
                 <p class="system-subtitle">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</p>
             </div>
         </div>
         <div class="system-badge-right">
-            ⚡ Ready to Extract
+            ⚡ Ready
         </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# Sidebar Settings (Default to Deep Crawl)
-with st.sidebar:
-    st.header("⚙️ Crawler Settings")
-    crawl_mode = st.radio(
-        "Crawl Mode",
-        options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
-        index=0,  # Deep Crawl is default
-        help="'Deep Crawl' explores course blocks and connected subpages. 'Current Page Only' targets just the provided URL.",
-    )
+# 2. PROMINENTLY HIGHLIGHTED SEARCH & SETTINGS BOX
+with st.container():
+    st.markdown('<div class="highlighted-input-box">', unsafe_allow_html=True)
+    st.markdown('<div class="input-label-highlight"><span>🔗 Paste Repository, Archive, or Webpage URL:</span></div>', unsafe_allow_html=True)
+
+    url_col, btn_col = st.columns([4, 1])
+    with url_col:
+        # No placeholder URL; clean blinking cursor
+        target_url = st.text_input(
+            "Target URL",
+            placeholder="",
+            label_visibility="collapsed",
+        )
+    with btn_col:
+        start_btn = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
+
+    # Inline Settings directly inside the white highlighted box
+    with st.expander("⚙️ Crawler Settings", expanded=False):
+        scol1, scol2, scol3 = st.columns([2, 1, 1])
+        with scol1:
+            crawl_mode = st.radio(
+                "Crawl Mode",
+                options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
+                index=0,  # Deep Crawl is default
+                horizontal=True,
+            )
+        with scol2:
+            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=300, value=30)
+        with scol3:
+            request_delay = st.slider("Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+
     max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
-    max_pages = st.number_input("Maximum Pages to Crawl", min_value=1, max_value=300, value=30)
-    request_delay = st.slider("Request Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# 2. PROMINENTLY HIGHLIGHTED URL INPUT SECTION (First and Center)
-st.markdown(
-    """
-    <div class="highlighted-input-box">
-        <div class="input-label-highlight">
-            <span>🔗 Paste Repository, Archive, or Webpage URL:</span>
-        </div>
-        <div class="input-sub-tip">
-            Supports eGyanKosh course units, government archive tables (NTA/JEE), and general PDF resource links.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# 3. RESULTS & PROGRESS BAR (Appears directly between the Search Box and the 5 small boxes)
+if start_btn:
+    if not target_url.strip():
+        st.warning("Please enter a valid URL.")
+    else:
+        url = target_url.strip().strip("'\"")
+        if not urlparse(url).scheme:
+            url = "https://" + url
 
-url_col, btn_col = st.columns([4, 1])
-with url_col:
-    target_url = st.text_input(
-        "Enter Target URL",
-        placeholder="https://egyankosh.ac.in/handle/123456789/... or https://jeemain.nta.nic.in/document-category/archive/page/11/",
-        label_visibility="collapsed",
-    )
-with btn_col:
-    start_btn = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
+        with tempfile.TemporaryDirectory(prefix="pdf_extract_") as temp_dir:
+            status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
+            downloader = WebDownloader(
+                start_url=url,
+                delay=request_delay,
+                max_pages=max_pages,
+                max_depth=max_depth,
+                status_container=status_box,
+            )
+            downloader.temp_dir = Path(temp_dir)
 
-# 3. COMPACT COLORFUL STATUS TILES (Reduced Size, No Arrows)
+            progress_bar = st.progress(0.0)
+            downloader.crawl(progress_bar=progress_bar)
+            progress_bar.progress(1.0)
+            status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
+
+            downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
+            failed_count = sum(1 for r in downloader.records if r.status == "Failed")
+
+            # Metric KPI Cards
+            mcol1, mcol2, mcol3 = st.columns(3)
+            with mcol1:
+                st.markdown(
+                    f"""
+                    <div style="background: #e0f2fe; border-radius: 10px; padding: 12px; border-left: 5px solid #0284c7;">
+                        <div style="font-size: 11px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
+                        <div style="font-size: 24px; font-weight: 800; color: #0c4a6e;">{len(downloader.visited)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with mcol2:
+                st.markdown(
+                    f"""
+                    <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
+                        <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
+                        <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with mcol3:
+                st.markdown(
+                    f"""
+                    <div style="background: #fee2e2; border-radius: 10px; padding: 12px; border-left: 5px solid #dc2626;">
+                        <div style="font-size: 11px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
+                        <div style="font-size: 24px; font-weight: 800; color: #991b1b;">{failed_count}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.write("")
+
+            if downloaded_count > 0:
+                zip_data = build_zip_in_memory(downloader.downloaded_files, downloader.records)
+
+                st.download_button(
+                    label="📥 Download All Harvested PDFs + Metadata (ZIP)",
+                    data=zip_data,
+                    file_name="harvested_pdfs.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+                st.subheader("📋 Document Manifest & Metadata")
+                manifest_view = [
+                    {
+                        "Document Title": r.title,
+                        "Author / Contributor": r.authors or "—",
+                        "Issue Date": r.date or "—",
+                        "Publisher / Source": r.publisher or "—",
+                        "File Name": r.filename,
+                        "Size (KB)": round(r.size_bytes / 1024, 1),
+                        "Status": r.status,
+                    }
+                    for r in downloader.records
+                ]
+                st.dataframe(manifest_view, use_container_width=True)
+            else:
+                st.info("No PDF documents were found at the provided URL.")
+
+# 4. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
 tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
 with tcol1:
     st.markdown(
@@ -838,98 +941,6 @@ with tcol5:
         """,
         unsafe_allow_html=True,
     )
-
-# 4. Crawler Execution & Results
-if start_btn:
-    if not target_url.strip():
-        st.warning("Please enter a valid URL to extract PDFs.")
-    else:
-        url = target_url.strip().strip("'\"")
-        if not urlparse(url).scheme:
-            url = "https://" + url
-
-        with tempfile.TemporaryDirectory(prefix="pdf_extract_") as temp_dir:
-            status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
-            downloader = WebDownloader(
-                start_url=url,
-                delay=request_delay,
-                max_pages=max_pages,
-                max_depth=max_depth,
-                status_container=status_box,
-            )
-            downloader.temp_dir = Path(temp_dir)
-
-            progress_bar = st.progress(0.0)
-            downloader.crawl(progress_bar=progress_bar)
-            progress_bar.progress(1.0)
-            status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
-
-            downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
-            failed_count = sum(1 for r in downloader.records if r.status == "Failed")
-
-            # Metric KPI Cards
-            mcol1, mcol2, mcol3 = st.columns(3)
-            with mcol1:
-                st.markdown(
-                    f"""
-                    <div style="background: #e0f2fe; border-radius: 12px; padding: 14px; border-left: 5px solid #0284c7;">
-                        <div style="font-size: 12px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
-                        <div style="font-size: 28px; font-weight: 800; color: #0c4a6e;">{len(downloader.visited)}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with mcol2:
-                st.markdown(
-                    f"""
-                    <div style="background: #dcfce7; border-radius: 12px; padding: 14px; border-left: 5px solid #16a34a;">
-                        <div style="font-size: 12px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
-                        <div style="font-size: 28px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with mcol3:
-                st.markdown(
-                    f"""
-                    <div style="background: #fee2e2; border-radius: 12px; padding: 14px; border-left: 5px solid #dc2626;">
-                        <div style="font-size: 12px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
-                        <div style="font-size: 28px; font-weight: 800; color: #991b1b;">{failed_count}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-            st.write("")
-
-            if downloaded_count > 0:
-                zip_data = build_zip_in_memory(downloader.downloaded_files, downloader.records)
-
-                st.download_button(
-                    label="📥 Download All Harvested PDFs + Metadata (ZIP)",
-                    data=zip_data,
-                    file_name="harvested_pdfs.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                )
-
-                st.subheader("📋 Document Manifest & Metadata")
-                manifest_view = [
-                    {
-                        "Document Title": r.title,
-                        "Author / Contributor": r.authors or "—",
-                        "Issue Date": r.date or "—",
-                        "Publisher / Source": r.publisher or "—",
-                        "File Name": r.filename,
-                        "Size (KB)": round(r.size_bytes / 1024, 1),
-                        "Status": r.status,
-                    }
-                    for r in downloader.records
-                ]
-                st.dataframe(manifest_view, use_container_width=True)
-            else:
-                st.info("No PDF documents were found at the provided URL.")
 
 # 5. Footer Banner
 st.markdown(
