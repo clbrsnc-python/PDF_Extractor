@@ -430,7 +430,7 @@ class WebDownloader:
                     queue.append((href, depth + 1))
 
         # 4. Automatic ASP.NET Dropdown Session Exploration (e.g. WBCSC SETQuestionPaper.aspx)
-        if depth < self.max_depth and (page_url.lower().endswith(".aspx") or soup.find("input", attrs={"name": "__VIEWSTATE"})):
+        if (page_url.lower().endswith(".aspx") or soup.find("input", attrs={"name": "__VIEWSTATE"})):
             self.process_aspnet_dropdowns(soup, page_url, queue, depth)
 
     def extract_dspace_pdf_links(self, soup: BeautifulSoup, page_url: str):
@@ -524,6 +524,161 @@ class WebDownloader:
             "language": first("DC.language", "dc.language", "citation_language"),
             "type": first("DC.type", "dc.type", "Type"),
         }
+
+    def download_aspnet_postback(self, page_url: str, soup: BeautifulSoup, target: str, argument: str,
+                                 base_filename: str, meta: dict | None = None, page_title: str = ""):
+        """Executes an ASP.NET __doPostBack to stream server-generated PDFs (e.g. WBCSC question papers)."""
+        post_key = f"{page_url}#{target}#{argument}"
+        if post_key in self.pdf_url_seen:
+            return
+        self.pdf_url_seen.add(post_key)
+
+        meta = dict(meta or {})
+        item_title = meta.get("title") or page_title or base_filename
+
+        stem = base_filename[:-4] if base_filename.lower().endswith(".pdf") else base_filename
+        target_path = self.temp_dir / base_filename
+        counter = 2
+        existing_names = {f for f, _, _ in self.downloaded_files}
+        while target_path.exists() or target_path.name in existing_names:
+            target_path = self.temp_dir / f"{stem}_{counter}.pdf"
+            counter += 1
+
+        filename = target_path.name
+        self.log(f"⬇️ Downloading (ASP.NET): **{filename}**")
+
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+
+            data = extract_aspnet_form_data(soup)
+            data["__EVENTTARGET"] = target
+            data["__EVENTARGUMENT"] = argument
+
+            response = self.session.post(
+                page_url,
+                data=data,
+                headers={"Referer": page_url},
+                timeout=self.timeout,
+                stream=True,
+                verify=False,
+            )
+            response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "").lower()
+            content_disp = response.headers.get("content-disposition", "")
+            if "filename=" in content_disp:
+                m_fn = re.search(r"""filename=["']?([^"';]+)""", content_disp)
+                if m_fn:
+                    parsed_fn = safe_filename(m_fn.group(1))
+                    if parsed_fn:
+                        filename = parsed_fn
+                        target_path = self.temp_dir / filename
+
+            total = 0
+            signature = b""
+            with target_path.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 128):
+                    if not chunk:
+                        continue
+                    if len(signature) < 1024:
+                        signature += chunk[:1024 - len(signature)]
+                    output.write(chunk)
+                    total += len(chunk)
+            response.close()
+
+            # Clean and robust PDF signature verification
+            if b"%PDF-" not in signature:
+                target_path.unlink(missing_ok=True)
+                raise ValueError(f"Content is not a PDF (content-type: '{content_type or 'unknown'}')")
+
+            pdf_internal_meta = extract_pdf_file_metadata(target_path)
+            for k, v in pdf_internal_meta.items():
+                if not meta.get(k) and v:
+                    meta[k] = v
+
+            self.downloaded_files.append((filename, target_path, page_url))
+            self.records.append(DownloadRecord(
+                title=meta.get("title") or item_title,
+                authors=meta.get("authors", ""),
+                date=meta.get("date", ""),
+                publisher=meta.get("publisher", ""),
+                subject=meta.get("subject", ""),
+                description=meta.get("description", ""),
+                language=meta.get("language", ""),
+                item_type="PDF Document",
+                page_url=page_url,
+                pdf_url=page_url,
+                filename=filename,
+                size_bytes=total,
+                status="Downloaded",
+                error="",
+            ))
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            self.records.append(DownloadRecord(
+                title=item_title,
+                authors=meta.get("authors", ""),
+                date=meta.get("date", ""),
+                publisher=meta.get("publisher", ""),
+                subject=meta.get("subject", ""),
+                description=meta.get("description", ""),
+                language=meta.get("language", ""),
+                item_type="PDF Document",
+                page_url=page_url,
+                pdf_url=page_url,
+                filename=filename,
+                size_bytes=0,
+                status="Failed",
+                error=str(exc),
+            ))
+            self.log(f"❌ Failed `{filename}`: {exc}")
+
+    def process_aspnet_dropdowns(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
+        """Automatically loops through ASP.NET examination session dropdowns (e.g. SET 27th, 26th, etc.)."""
+        form_data = extract_aspnet_form_data(soup)
+        if "__VIEWSTATE" not in form_data:
+            return
+
+        for sel in soup.find_all("select"):
+            sel_name = sel.get("name")
+            if not sel_name:
+                continue
+
+            for opt in sel.find_all("option"):
+                opt_val = opt.get("value", "").strip()
+                opt_text = clean_text(opt.get_text(" ", strip=True))
+                if not opt_val or opt_val in ("0", "-1", "") or opt_text.startswith("--") or "select" in opt_text.lower():
+                    continue
+
+                session_key = f"{page_url}?{sel_name}={opt_val}"
+                if session_key in self.visited:
+                    continue
+                self.visited.add(session_key)
+
+                try:
+                    self.log(f"🔎 Exploring Examination Session: **{opt_text}**")
+                    payload = dict(form_data)
+                    payload["__EVENTTARGET"] = sel_name
+                    payload["__EVENTARGUMENT"] = ""
+                    payload[sel_name] = opt_val
+
+                    res = self.session.post(
+                        page_url,
+                        data=payload,
+                        headers={"Referer": page_url},
+                        timeout=self.timeout,
+                        verify=False
+                    )
+                    if res.status_code == 200 and "text/html" in res.headers.get("content-type", ""):
+                        sub_soup = BeautifulSoup(res.text, "html.parser")
+                        self.process_generic(sub_soup, page_url, queue, depth + 1)
+                        del sub_soup
+                    res.close()
+                    del res
+                    gc.collect()
+                except Exception as exc:
+                    self.log(f"⚠️ Could not load session `{opt_text}`: {exc}")
 
     def download_pdf(self, pdf_url: str, base_filename: str, page_url: str,
                      meta: dict | None = None, page_title: str = ""):
