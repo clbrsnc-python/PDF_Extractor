@@ -14,6 +14,7 @@ import re
 import time
 import zipfile
 import tempfile
+import shutil
 from collections import deque
 from dataclasses import dataclass
 from html import unescape
@@ -24,6 +25,7 @@ import urllib3
 import requests
 from bs4 import BeautifulSoup
 import streamlit as st
+import pandas as pd
 
 # Optional pypdf for reading internal PDF metadata
 try:
@@ -70,6 +72,17 @@ def safe_filename(name: str, fallback: str = "document.pdf") -> str:
     if not name.lower().endswith(".pdf"):
         name += ".pdf"
     return name[:180]
+
+
+def safe_folder_name(name: str, fallback: str = "harvested_pdfs") -> str:
+    name = unquote(name or "").strip()
+    name = BAD_CHARS.sub("_", name)
+    name = name.strip(" .")
+    if not name:
+        name = fallback
+    if name.upper() in WINDOWS_RESERVED:
+        name = f"folder_{name}"
+    return name[:120]
 
 
 def clean_url(url: str) -> str:
@@ -559,13 +572,14 @@ class WebDownloader:
             self.log(f"❌ Failed `{filename}`: {exc}")
 
 
-def build_zip_in_memory(downloaded_files, records) -> bytes:
+def build_zip_in_memory(downloaded_files, records, folder_name: str = "harvested_pdfs") -> bytes:
+    clean_folder = safe_folder_name(folder_name)
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename, local_path, _ in downloaded_files:
             try:
                 if local_path.exists():
-                    zf.write(local_path, f"PDFs/{filename}")
+                    zf.write(local_path, f"{clean_folder}/PDFs/{filename}")
             except Exception:
                 pass
 
@@ -579,7 +593,7 @@ def build_zip_in_memory(downloaded_files, records) -> bytes:
         writer.writeheader()
         for rec in records:
             writer.writerow(rec.__dict__)
-        zf.writestr("metadata.csv", "\ufeff" + csv_buf.getvalue())
+        zf.writestr(f"{clean_folder}/metadata.csv", ("\ufeff" + csv_buf.getvalue()).encode("utf-8"))
 
     return zip_buffer.getvalue()
 
@@ -861,8 +875,16 @@ with st.container():
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Initialize persistent session state for extraction results
-if "extraction_result" not in st.session_state:
-    st.session_state["extraction_result"] = None
+if "raw_harvest" not in st.session_state:
+    st.session_state["raw_harvest"] = None
+if "session_temp_dir" not in st.session_state:
+    st.session_state["session_temp_dir"] = None
+if "selected_filenames" not in st.session_state:
+    st.session_state["selected_filenames"] = {}
+if "bundle_folder_name" not in st.session_state:
+    st.session_state["bundle_folder_name"] = "harvested_pdfs"
+if "editor_version" not in st.session_state:
+    st.session_state["editor_version"] = 0
 
 # 3. EXTRACTION ENGINE TRIGGER
 if start_btn:
@@ -873,61 +895,58 @@ if start_btn:
         if not urlparse(url).scheme:
             url = "https://" + url
 
-        with tempfile.TemporaryDirectory(prefix="pdf_extract_") as temp_dir:
-            status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
-            downloader = WebDownloader(
-                start_url=url,
-                delay=request_delay,
-                max_pages=max_pages,
-                max_depth=max_depth,
-                status_container=status_box,
-            )
-            downloader.temp_dir = Path(temp_dir)
+        # Clean up old session temp directory if any
+        if st.session_state.get("session_temp_dir"):
+            shutil.rmtree(st.session_state["session_temp_dir"], ignore_errors=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="pdf_harvest_"))
+        st.session_state["session_temp_dir"] = str(temp_dir)
 
-            progress_bar = st.progress(0.0)
-            downloader.crawl(progress_bar=progress_bar)
-            progress_bar.progress(1.0)
-            status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
+        status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
+        downloader = WebDownloader(
+            start_url=url,
+            delay=request_delay,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            status_container=status_box,
+        )
+        downloader.temp_dir = temp_dir
 
-            downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
-            failed_count = sum(1 for r in downloader.records if r.status == "Failed")
+        progress_bar = st.progress(0.0)
+        downloader.crawl(progress_bar=progress_bar)
+        progress_bar.progress(1.0)
+        status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
 
+        downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
+        failed_count = sum(1 for r in downloader.records if r.status == "Failed")
 
+        # Suggest default folder name based on URL path or fallback
+        path_name = PurePosixPath(urlparse(url).path).stem
+        default_folder = safe_folder_name(path_name) if path_name and len(path_name) > 3 else "harvested_pdfs"
+        st.session_state["bundle_folder_name"] = default_folder
 
-            zip_data = None
-            if downloaded_count > 0:
-                zip_data = build_zip_in_memory(downloader.downloaded_files, downloader.records)
+        # Initialize all downloaded files to Keep = True
+        st.session_state["selected_filenames"] = {
+            f: True for f, _, _ in downloader.downloaded_files
+        }
+        st.session_state["editor_version"] = 0
 
-            manifest_view = [
-                {
-                    "Document Title": r.title,
-                    "Author / Contributor": r.authors or "—",
-                    "Issue Date": r.date or "—",
-                    "Publisher / Source": r.publisher or "—",
-                    "File Name": r.filename,
-                    "Size (KB)": round(r.size_bytes / 1024, 1),
-                    "Status": r.status,
-                }
-                for r in downloader.records
-            ]
+        # Save harvest records in session_state
+        st.session_state["raw_harvest"] = {
+            "visited_count": len(downloader.visited),
+            "downloaded_count": downloaded_count,
+            "failed_count": failed_count,
+            "downloaded_files": downloader.downloaded_files,
+            "records": downloader.records,
+        }
 
-            # Persist results in session_state so clicking download does NOT reload or wipe the app
-            st.session_state["extraction_result"] = {
-                "visited_count": len(downloader.visited),
-                "downloaded_count": downloaded_count,
-                "failed_count": failed_count,
-                "zip_data": zip_data,
-                "manifest_view": manifest_view,
-            }
-
-# 4. PERSISTENT RESULTS & DOWNLOAD BUTTON (Survives button clicks and app reruns)
-if st.session_state.get("extraction_result"):
-    res = st.session_state["extraction_result"]
-    downloaded_count = res["downloaded_count"]
-    failed_count = res["failed_count"]
-    visited_count = res["visited_count"]
-    zip_data = res["zip_data"]
-    manifest_view = res["manifest_view"]
+# 4. PERSISTENT RESULTS & SELECTION CONTROLS (Survives button clicks and app reruns)
+if st.session_state.get("raw_harvest"):
+    harvest = st.session_state["raw_harvest"]
+    downloaded_count = harvest["downloaded_count"]
+    failed_count = harvest["failed_count"]
+    visited_count = harvest["visited_count"]
+    downloaded_files = harvest["downloaded_files"]
+    records = harvest["records"]
 
     # Metric KPI Cards
     mcol1, mcol2, mcol3 = st.columns(3)
@@ -945,7 +964,7 @@ if st.session_state.get("extraction_result"):
         st.markdown(
             f"""
             <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
-                <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
+                <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs HARVESTED</div>
                 <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
             </div>
             """,
@@ -964,22 +983,99 @@ if st.session_state.get("extraction_result"):
 
     st.write("")
 
-    if downloaded_count > 0 and zip_data:
-        st.download_button(
-            label="📥 Download All Harvested PDFs + Metadata (ZIP)",
-            data=zip_data,
-            file_name="harvested_pdfs.zip",
-            mime="application/zip",
-            type="primary",
+    if downloaded_count > 0:
+        st.markdown("### 📦 Bundle Customization & Document Selection")
+
+        # 1. Ask for folder name after execution
+        f_col1, f_col2 = st.columns([2, 1])
+        with f_col1:
+            custom_folder = st.text_input(
+                "📁 Custom Folder & Archive Name:",
+                value=st.session_state.get("bundle_folder_name", "harvested_pdfs"),
+                help="Name of the exported ZIP and root directory containing your PDFs and metadata.csv",
+                key="input_bundle_name",
+            )
+            st.session_state["bundle_folder_name"] = custom_folder
+        with f_col2:
+            clean_name = safe_folder_name(custom_folder)
+            st.caption("Archive Layout Preview:")
+            st.code(f"{clean_name}.zip\n  ├── {clean_name}/PDFs/...\n  └── {clean_name}/metadata.csv", language="text")
+
+        # 2. Select All / Deselect All controls
+        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
+        with sel_col1:
+            if st.button("✅ Select All", use_container_width=True):
+                for f, _, _ in downloaded_files:
+                    st.session_state["selected_filenames"][f] = True
+                st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+                st.rerun()
+        with sel_col2:
+            if st.button("❌ Deselect All", use_container_width=True):
+                for f, _, _ in downloaded_files:
+                    st.session_state["selected_filenames"][f] = False
+                st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+                st.rerun()
+
+        # Prepare DataFrame for interactive keep/ignore selection
+        doc_list = []
+        for rec in records:
+            if rec.status == "Downloaded":
+                is_kept = st.session_state["selected_filenames"].get(rec.filename, True)
+                doc_list.append({
+                    "Keep": is_kept,
+                    "Document Title": rec.title,
+                    "File Name": rec.filename,
+                    "Size (KB)": round(rec.size_bytes / 1024, 1),
+                    "Issue Date": rec.date or "—",
+                    "Publisher / Source": rec.publisher or "—",
+                })
+
+        df = pd.DataFrame(doc_list)
+        editor_key = f"manifest_editor_{st.session_state.get('editor_version', 0)}"
+        edited_df = st.data_editor(
+            df,
+            column_config={
+                "Keep": st.column_config.CheckboxColumn("Keep", default=True, help="Check to include in ZIP bundle"),
+            },
+            disabled=["Document Title", "File Name", "Size (KB)", "Issue Date", "Publisher / Source"],
+            hide_index=True,
             use_container_width=True,
-            key="download_harvested_zip_btn",
+            key=editor_key,
         )
 
-        st.subheader("📋 Document Manifest & Metadata")
-        st.dataframe(manifest_view, use_container_width=True)
+        # Sync user checkbox edits back to session state
+        kept_filenames = set(edited_df[edited_df["Keep"] == True]["File Name"])
+        for f, _, _ in downloaded_files:
+            st.session_state["selected_filenames"][f] = (f in kept_filenames)
+
+        # Filter selected files & records
+        selected_files = [f for f in downloaded_files if f[0] in kept_filenames]
+        selected_records = [r for r in records if r.filename in kept_filenames]
+
+        with sel_col3:
+            total_kb = sum(r.size_bytes for r in selected_records) / 1024
+            size_str = f"{round(total_kb / 1024, 2)} MB" if total_kb >= 1024 else f"{round(total_kb, 1)} KB"
+            st.markdown(f"<div style='padding-top: 6px; font-weight: 700; color: #1e40af;'>📌 Selected: {len(selected_files)} of {downloaded_count} documents ({size_str})</div>", unsafe_allow_html=True)
+
+        st.write("")
+
+        # 3. Only the keep selected will be downloaded along with metadata
+        if selected_files:
+            zip_data = build_zip_in_memory(selected_files, selected_records, folder_name=clean_name)
+            st.download_button(
+                label=f"📥 Download {len(selected_files)} Selected PDFs + Metadata (ZIP)",
+                data=zip_data,
+                file_name=f"{clean_name}.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+                key="download_harvested_zip_btn",
+            )
+        else:
+            st.warning("⚠️ No documents selected. Please check at least one document to enable ZIP download.")
     else:
         st.info("No PDF documents were found at the provided URL.")
-# 4. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
+# 5. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
 tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
 with tcol1:
     st.markdown(
