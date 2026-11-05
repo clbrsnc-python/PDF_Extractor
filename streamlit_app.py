@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Universal PDF Extractor - Streamlit Web App
--------------------------------------------
-Clean, mobile-optimized interface with golden/white typography,
-inline crawler settings, and immediate result placement above feature tiles.
+Universal PDF Extractor - Streamlit Web App (PDF-Only Architecture)
+-------------------------------------------------------------------
+Rock-solid, dedicated PDF harvesting engine for DSpace repositories,
+academic portals, and educational resource websites.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ try:
 except Exception:
     HAS_PYPDF = False
 
-# Suppress insecure SSL warnings
+# Suppress insecure SSL warnings for educational/institutional portals
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 USER_AGENT = (
@@ -58,65 +58,18 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(value or "")).strip()
 
 
-DOC_EXTENSIONS = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".ppt", ".pptx", ".xls", ".xlsx"}
-
-def detect_document_format(signature: bytes, path_or_name: str, content_type: str = "") -> tuple[str, str]:
-    sig = signature[:1024]
-    name_lower = path_or_name.lower()
-    ct_lower = content_type.lower()
-
-    if b"%PDF-" in sig:
-        return "PDF Document", ".pdf"
-    if sig.startswith(b"PK"):
-        if ".docx" in name_lower or "word" in ct_lower:
-            return "Word Document (.docx)", ".docx"
-        elif ".pptx" in name_lower or "presentation" in ct_lower:
-            return "PowerPoint Presentation (.pptx)", ".pptx"
-        elif ".xlsx" in name_lower or "spreadsheet" in ct_lower:
-            return "Excel Spreadsheet (.xlsx)", ".xlsx"
-        ext = Path(path_or_name).suffix.lower()
-        return "Office Document", ext if ext in DOC_EXTENSIONS else ".docx"
-    if sig.startswith(bytes([0xd0, 0xcf, 0x11, 0xe0])):
-        if ".doc" in name_lower or "msword" in ct_lower or "word" in ct_lower:
-            return "Word Document (.doc)", ".doc"
-        elif ".ppt" in name_lower:
-            return "PowerPoint (.ppt)", ".ppt"
-        return "Word Document (.doc)", ".doc"
-    if sig.startswith(b"{\rtf"):
-        return "Rich Text (.rtf)", ".rtf"
-    
-    # Fallback by content type or name
-    if "application/pdf" in ct_lower or name_lower.endswith(".pdf"):
-        return "PDF Document", ".pdf"
-    if "word" in ct_lower or name_lower.endswith(".docx"):
-        return "Word Document (.docx)", ".docx"
-    if name_lower.endswith(".doc"):
-        return "Word Document (.doc)", ".doc"
-
-    return "", ""
-
-def is_academic_doc_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return any(path.endswith(ext) or f"{ext}?" in url.lower() for ext in (".pdf", ".doc", ".docx", ".rtf", ".odt", ".ppt", ".pptx")) or "/bitstream/" in path
-
-def safe_filename(name: str, fallback: str = "document.pdf", default_ext: str = ".pdf") -> str:
+def safe_filename(name: str, fallback: str = "document.pdf") -> str:
     name = unquote(name or "").strip()
     name = BAD_CHARS.sub("_", name)
     name = name.strip(" .")
     if not name:
         name = fallback
-
-    ext = Path(name).suffix.lower()
-    if ext in DOC_EXTENSIONS:
-        stem = name[:-len(ext)]
-        if stem.upper() in WINDOWS_RESERVED:
-            name = f"doc_{name}"
-        return name[:180]
-
-    stem = name
+    stem = name[:-4] if name.lower().endswith(".pdf") else name
     if stem.upper() in WINDOWS_RESERVED:
-        stem = f"doc_{stem}"
-    return f"{stem}{default_ext}"[:180]
+        name = f"doc_{name}"
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    return name[:180]
 
 
 def clean_url(url: str) -> str:
@@ -139,6 +92,11 @@ def normalize_host(netloc: str) -> str:
 
 def same_site(url: str, host: str) -> bool:
     return normalize_host(urlparse(url).netloc) == normalize_host(host)
+
+
+def is_pdf_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".pdf") or ".pdf?" in url.lower() or "/bitstream/" in path
 
 
 def extract_pdf_file_metadata(pdf_path: Path) -> dict:
@@ -274,12 +232,10 @@ class WebDownloader:
                 response = self.get(url)
                 content_type = response.headers.get("content-type", "").lower()
 
-                # Direct PDF or Document URL
-                if any(ct in content_type for ct in ("application/pdf", "msword", "wordprocessingml", "opendocument")) or any(url.lower().endswith(ext) for ext in (".pdf", ".doc", ".docx", ".rtf")):
-                    raw_name = PurePosixPath(urlparse(url).path).name
-                    ext = Path(raw_name).suffix.lower() or ".pdf"
-                    filename = safe_filename(raw_name, default_ext=ext)
-                    self.download_pdf(url, filename, url, page_title=filename, meta={})
+                # Direct PDF URL
+                if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+                    filename = safe_filename(PurePosixPath(urlparse(url).path).name)
+                    self.download_pdf(url, filename, url, page_title=filename[:-4], meta={})
                     continue
 
                 if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -352,12 +308,12 @@ class WebDownloader:
     def process_generic(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
         page_meta = self.extract_generic_page_metadata(soup, page_url)
 
-        # Parse tables: extract title, date, and PDF link
+        # 1. Parse tables: extract title, date, and PDF link
         for table in soup.find_all("table"):
             headers = [clean_text(th.get_text(" ", strip=True)).lower() for th in table.find_all("th")]
             date_col_idx = -1
             for idx, h in enumerate(headers):
-                if any(w in h for w in ("date", "year", "published", "issue")):
+                if any(w in h for w in ("date", "year", "session", "published", "issue")):
                     date_col_idx = idx
                     break
 
@@ -366,14 +322,12 @@ class WebDownloader:
                 if len(cells) >= 2:
                     for a in row.find_all("a", href=True):
                         href = urljoin(page_url, a["href"])
-                        u = urlparse(href)
-                        if is_academic_doc_url(href):
+                        link_text = clean_text(a.get_text(" ", strip=True))
+                        # Identify PDF by extension or viewer text
+                        if is_pdf_url(href) or any(w in link_text.lower() for w in ("view(", "accessible version", "download", "pdf")):
                             first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
-                            ext = Path(u.path).suffix.lower()
-                            if ext not in DOC_EXTENSIONS:
-                                ext = ".docx" if ".docx" in href.lower() else (".doc" if ".doc" in href.lower() else ".pdf")
-                            title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(u.path).name
-                            filename = safe_filename(title, default_ext=ext)
+                            title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(urlparse(href).path).name
+                            filename = safe_filename(title)
 
                             row_meta = dict(page_meta)
                             row_meta["title"] = title
@@ -384,23 +338,19 @@ class WebDownloader:
 
                             self.download_pdf(href, filename, page_url, meta=row_meta, page_title=title)
 
-        # Parse any direct PDF links outside tables
+        # 2. Parse any direct PDF links outside tables
         for a in soup.find_all("a", href=True):
             href = urljoin(page_url, a["href"])
-            u = urlparse(href)
-            if is_academic_doc_url(href):
-                link_text = clean_text(a.get_text(" ", strip=True))
-                ext = Path(u.path).suffix.lower()
-                if ext not in DOC_EXTENSIONS:
-                    ext = ".docx" if ".docx" in href.lower() else (".doc" if ".doc" in href.lower() else ".pdf")
-                raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "doc", "download", "view", "link"]) else PurePosixPath(u.path).name
-                filename = safe_filename(raw_name or PurePosixPath(u.path).name, default_ext=ext)
+            link_text = clean_text(a.get_text(" ", strip=True))
+            if is_pdf_url(href):
+                raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "download", "view", "link"]) else PurePosixPath(urlparse(href).path).name
+                filename = safe_filename(raw_name or PurePosixPath(urlparse(href).path).name)
 
                 link_meta = dict(page_meta)
                 link_meta["title"] = raw_name or link_meta.get("title", filename)
                 self.download_pdf(href, filename, page_url, meta=link_meta, page_title=link_meta["title"])
 
-        # Follow subpages within depth limit
+        # 3. Follow subpages within depth limit
         if depth < self.max_depth:
             for a in soup.find_all("a", href=True):
                 href = canonical(urljoin(page_url, a["href"]))
@@ -515,12 +465,11 @@ class WebDownloader:
         meta = dict(meta or {})
         item_title = meta.get("title") or page_title or base_filename
 
-        current_ext = Path(base_filename).suffix.lower() or ".pdf"
-        stem = base_filename[:-len(current_ext)] if base_filename.lower().endswith(current_ext) else base_filename
+        stem = base_filename[:-4] if base_filename.lower().endswith(".pdf") else base_filename
         target_path = self.temp_dir / base_filename
         counter = 2
         while target_path.exists() and target_path not in [p for _, p, _ in self.downloaded_files]:
-            target_path = self.temp_dir / f"{stem}_{counter}{current_ext}"
+            target_path = self.temp_dir / f"{stem}_{counter}.pdf"
             counter += 1
 
         filename = target_path.name
@@ -545,25 +494,16 @@ class WebDownloader:
                     total += len(chunk)
             response.close()
 
-            # Multi-format validation (PDF, DOC, DOCX, RTF, PPT)
-            doc_type, detected_ext = detect_document_format(signature, target_path.name, content_type)
-            if not doc_type:
+            # Clean and robust PDF signature verification
+            if b"%PDF-" not in signature:
                 target_path.unlink(missing_ok=True)
-                raise ValueError(f"Content is not a recognized document format (content-type: '{content_type or 'unknown'}')")
+                raise ValueError(f"Content is not a PDF (content-type: '{content_type or 'unknown'}')")
 
-            # Auto-correct file extension if server returned DOC/DOCX disguised or without extension
-            if detected_ext and target_path.suffix.lower() != detected_ext:
-                corrected_path = target_path.with_suffix(detected_ext)
-                target_path.replace(corrected_path)
-                target_path = corrected_path
-                filename = target_path.name
-
-            # Extract internal PDF metadata if PDF
-            if detected_ext == ".pdf":
-                pdf_internal_meta = extract_pdf_file_metadata(target_path)
-                for k, v in pdf_internal_meta.items():
-                    if not meta.get(k) and v:
-                        meta[k] = v
+            # Extract internal PDF metadata if available
+            pdf_internal_meta = extract_pdf_file_metadata(target_path)
+            for k, v in pdf_internal_meta.items():
+                if not meta.get(k) and v:
+                    meta[k] = v
 
             self.downloaded_files.append((filename, target_path, pdf_url))
             self.records.append(DownloadRecord(
@@ -574,7 +514,7 @@ class WebDownloader:
                 subject=meta.get("subject", ""),
                 description=meta.get("description", ""),
                 language=meta.get("language", ""),
-                item_type=doc_type or "Document",
+                item_type="PDF Document",
                 page_url=page_url,
                 pdf_url=pdf_url,
                 filename=filename,
@@ -592,7 +532,7 @@ class WebDownloader:
                 subject=meta.get("subject", ""),
                 description=meta.get("description", ""),
                 language=meta.get("language", ""),
-                item_type=meta.get("type", "PDF Document"),
+                item_type="PDF Document",
                 page_url=page_url,
                 pdf_url=pdf_url,
                 filename=filename,
@@ -690,8 +630,8 @@ st.markdown(
         font-size: 24px;
         box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
-    /* Title: PDF Extractor in Brilliant Golden */
-    /* Force dark, readable font on ALL widgets (radio, slider, number input, expander) across light & dark mode / mobile */
+
+    /* Force dark, readable font on ALL widgets on mobile */
     .stRadio label, .stRadio div, .stRadio p, .stRadio span {
         color: #0f172a !important;
         font-weight: 600 !important;
@@ -717,6 +657,7 @@ st.markdown(
         color: #0f172a !important;
     }
 
+    /* Title: PDF Extractor in Brilliant Golden */
     .system-title,
     h1.system-title,
     div.system-title,
@@ -733,7 +674,7 @@ st.markdown(
     .system-subtitle {
         font-size: 13px;
         font-weight: 500;
-        color: #ffffff;
+        color: #ffffff !important;
         margin: 0;
         letter-spacing: 0.4px;
     }
@@ -776,7 +717,6 @@ st.markdown(
         caret-color: #1d4ed8 !important;
         padding: 10px 14px !important;
         box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
-        animation: cursorBlink 1s infinite;
     }
     .stTextInput > div > div > input:focus {
         border-color: #1d4ed8 !important;
@@ -849,7 +789,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 1. Header: PDF Extractor (Golden / White font)
+# 1. Header: PDF Extractor (Golden & White)
 st.markdown(
     """
     <div class="system-header-card">
@@ -875,7 +815,6 @@ with st.container():
 
     url_col, btn_col = st.columns([4, 1])
     with url_col:
-        # No placeholder URL; clean blinking cursor
         target_url = st.text_input(
             "Target URL",
             placeholder="",
