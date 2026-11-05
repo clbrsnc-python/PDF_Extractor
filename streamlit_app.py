@@ -321,7 +321,12 @@ class WebDownloader:
                 cells = row.find_all(["td", "th"])
                 if len(cells) >= 2:
                     for a in row.find_all("a", href=True):
-                        href = urljoin(page_url, a["href"])
+                        raw_href = a["href"].strip()
+                        if not raw_href or raw_href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+                            continue
+                        href = urljoin(page_url, raw_href)
+                        if urlparse(href).scheme not in ("http", "https"):
+                            continue
                         link_text = clean_text(a.get_text(" ", strip=True))
                         # Identify PDF by extension or viewer text
                         if is_pdf_url(href) or any(w in link_text.lower() for w in ("view(", "accessible version", "download", "pdf")):
@@ -340,7 +345,12 @@ class WebDownloader:
 
         # 2. Parse any direct PDF links outside tables
         for a in soup.find_all("a", href=True):
-            href = urljoin(page_url, a["href"])
+            raw_href = a["href"].strip()
+            if not raw_href or raw_href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+                continue
+            href = urljoin(page_url, raw_href)
+            if urlparse(href).scheme not in ("http", "https"):
+                continue
             link_text = clean_text(a.get_text(" ", strip=True))
             if is_pdf_url(href):
                 raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "download", "view", "link"]) else PurePosixPath(urlparse(href).path).name
@@ -353,7 +363,10 @@ class WebDownloader:
         # 3. Follow subpages within depth limit
         if depth < self.max_depth:
             for a in soup.find_all("a", href=True):
-                href = canonical(urljoin(page_url, a["href"]))
+                raw_href = a["href"].strip()
+                if not raw_href or raw_href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+                    continue
+                href = canonical(urljoin(page_url, raw_href))
                 u = urlparse(href)
                 if u.scheme not in ("http", "https") or not same_site(href, self.host):
                     continue
@@ -458,6 +471,8 @@ class WebDownloader:
 
     def download_pdf(self, pdf_url: str, base_filename: str, page_url: str,
                      meta: dict | None = None, page_title: str = ""):
+        if not pdf_url or urlparse(pdf_url).scheme not in ("http", "https"):
+            return
         if pdf_url in self.pdf_url_seen:
             return
         self.pdf_url_seen.add(pdf_url)
@@ -468,7 +483,8 @@ class WebDownloader:
         stem = base_filename[:-4] if base_filename.lower().endswith(".pdf") else base_filename
         target_path = self.temp_dir / base_filename
         counter = 2
-        while target_path.exists() and target_path not in [p for _, p, _ in self.downloaded_files]:
+        existing_names = {f for f, _, _ in self.downloaded_files}
+        while target_path.exists() or target_path.name in existing_names:
             target_path = self.temp_dir / f"{stem}_{counter}.pdf"
             counter += 1
 
@@ -547,8 +563,11 @@ def build_zip_in_memory(downloaded_files, records) -> bytes:
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename, local_path, _ in downloaded_files:
-            if local_path.exists():
-                zf.write(local_path, f"PDFs/{filename}")
+            try:
+                if local_path.exists():
+                    zf.write(local_path, f"PDFs/{filename}")
+            except Exception:
+                pass
 
         csv_buf = io.StringIO()
         fieldnames = [
@@ -841,7 +860,11 @@ with st.container():
     max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
     st.markdown('</div>', unsafe_allow_html=True)
 
-# 3. RESULTS & PROGRESS BAR (Appears directly between the Search Box and the 5 small boxes)
+# Initialize persistent session state for extraction results
+if "extraction_result" not in st.session_state:
+    st.session_state["extraction_result"] = None
+
+# 3. EXTRACTION ENGINE TRIGGER
 if start_btn:
     if not target_url.strip():
         st.warning("Please enter a valid URL.")
@@ -869,70 +892,93 @@ if start_btn:
             downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
             failed_count = sum(1 for r in downloader.records if r.status == "Failed")
 
-            # Metric KPI Cards
-            mcol1, mcol2, mcol3 = st.columns(3)
-            with mcol1:
-                st.markdown(
-                    f"""
-                    <div style="background: #e0f2fe; border-radius: 10px; padding: 12px; border-left: 5px solid #0284c7;">
-                        <div style="font-size: 11px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
-                        <div style="font-size: 24px; font-weight: 800; color: #0c4a6e;">{len(downloader.visited)}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with mcol2:
-                st.markdown(
-                    f"""
-                    <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
-                        <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
-                        <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-            with mcol3:
-                st.markdown(
-                    f"""
-                    <div style="background: #fee2e2; border-radius: 10px; padding: 12px; border-left: 5px solid #dc2626;">
-                        <div style="font-size: 11px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
-                        <div style="font-size: 24px; font-weight: 800; color: #991b1b;">{failed_count}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
 
-            st.write("")
 
+            zip_data = None
             if downloaded_count > 0:
                 zip_data = build_zip_in_memory(downloader.downloaded_files, downloader.records)
 
-                st.download_button(
-                    label="📥 Download All Harvested PDFs + Metadata (ZIP)",
-                    data=zip_data,
-                    file_name="harvested_pdfs.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                )
+            manifest_view = [
+                {
+                    "Document Title": r.title,
+                    "Author / Contributor": r.authors or "—",
+                    "Issue Date": r.date or "—",
+                    "Publisher / Source": r.publisher or "—",
+                    "File Name": r.filename,
+                    "Size (KB)": round(r.size_bytes / 1024, 1),
+                    "Status": r.status,
+                }
+                for r in downloader.records
+            ]
 
-                st.subheader("📋 Document Manifest & Metadata")
-                manifest_view = [
-                    {
-                        "Document Title": r.title,
-                        "Author / Contributor": r.authors or "—",
-                        "Issue Date": r.date or "—",
-                        "Publisher / Source": r.publisher or "—",
-                        "File Name": r.filename,
-                        "Size (KB)": round(r.size_bytes / 1024, 1),
-                        "Status": r.status,
-                    }
-                    for r in downloader.records
-                ]
-                st.dataframe(manifest_view, use_container_width=True)
-            else:
-                st.info("No PDF documents were found at the provided URL.")
+            # Persist results in session_state so clicking download does NOT reload or wipe the app
+            st.session_state["extraction_result"] = {
+                "visited_count": len(downloader.visited),
+                "downloaded_count": downloaded_count,
+                "failed_count": failed_count,
+                "zip_data": zip_data,
+                "manifest_view": manifest_view,
+            }
 
+# 4. PERSISTENT RESULTS & DOWNLOAD BUTTON (Survives button clicks and app reruns)
+if st.session_state.get("extraction_result"):
+    res = st.session_state["extraction_result"]
+    downloaded_count = res["downloaded_count"]
+    failed_count = res["failed_count"]
+    visited_count = res["visited_count"]
+    zip_data = res["zip_data"]
+    manifest_view = res["manifest_view"]
+
+    # Metric KPI Cards
+    mcol1, mcol2, mcol3 = st.columns(3)
+    with mcol1:
+        st.markdown(
+            f"""
+            <div style="background: #e0f2fe; border-radius: 10px; padding: 12px; border-left: 5px solid #0284c7;">
+                <div style="font-size: 11px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
+                <div style="font-size: 24px; font-weight: 800; color: #0c4a6e;">{visited_count}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with mcol2:
+        st.markdown(
+            f"""
+            <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
+                <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
+                <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with mcol3:
+        st.markdown(
+            f"""
+            <div style="background: #fee2e2; border-radius: 10px; padding: 12px; border-left: 5px solid #dc2626;">
+                <div style="font-size: 11px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
+                <div style="font-size: 24px; font-weight: 800; color: #991b1b;">{failed_count}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.write("")
+
+    if downloaded_count > 0 and zip_data:
+        st.download_button(
+            label="📥 Download All Harvested PDFs + Metadata (ZIP)",
+            data=zip_data,
+            file_name="harvested_pdfs.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+            key="download_harvested_zip_btn",
+        )
+
+        st.subheader("📋 Document Manifest & Metadata")
+        st.dataframe(manifest_view, use_container_width=True)
+    else:
+        st.info("No PDF documents were found at the provided URL.")
 # 4. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
 tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
 with tcol1:
