@@ -42,6 +42,11 @@ USER_AGENT = (
 )
 HANDLE_RE = re.compile(r"/handle/(\d+)/([^/?#]+)", re.I)
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 SKIPPABLE_EXTENSIONS = {
     ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
     ".css", ".js", ".mp4", ".mp3", ".zip", ".tar", ".gz", ".7z",
@@ -357,7 +362,7 @@ class WebDownloader:
                     break
 
             for row in table.find_all("tr"):
-                cells = row.find_all("td")
+                cells = row.find_all(["td", "th"])
                 if len(cells) >= 2:
                     for a in row.find_all("a", href=True):
                         href = urljoin(page_url, a["href"])
@@ -416,7 +421,7 @@ class WebDownloader:
 
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
-                cells = row.find_all("td")
+                cells = row.find_all(["td", "th"])
                 row_links = [urljoin(page_url, a["href"]) for a in row.find_all("a", href=True) if "/bitstream/" in a["href"].lower()]
                 if not row_links:
                     continue
