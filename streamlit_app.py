@@ -112,6 +112,27 @@ def same_site(url: str, host: str) -> bool:
     return normalize_host(urlparse(url).netloc) == normalize_host(host)
 
 
+POSTBACK_RE = re.compile(r"""__doPostBack\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]\s*\)""", re.I)
+
+
+def extract_aspnet_form_data(soup: BeautifulSoup) -> dict:
+    """Extracts hidden fields (__VIEWSTATE, __EVENTVALIDATION) and control states for ASP.NET postbacks."""
+    data = {}
+    form = soup.find("form") or soup
+    for inp in form.find_all("input"):
+        n = inp.get("name")
+        v = inp.get("value", "")
+        if n:
+            data[n] = v
+    for sel in form.find_all("select"):
+        n = sel.get("name")
+        if n:
+            opt = sel.find("option", selected=True) or sel.find("option")
+            if opt and opt.get("value") is not None:
+                data[n] = opt.get("value")
+    return data
+
+
 def is_pdf_url(url: str) -> bool:
     path = urlparse(url).path.lower()
     return path.endswith(".pdf") or ".pdf?" in url.lower() or "/bitstream/" in path
@@ -344,27 +365,34 @@ class WebDownloader:
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
                 if len(cells) >= 2:
+                    first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
+                    row_meta = dict(page_meta)
+                    if date_col_idx != -1 and date_col_idx < len(cells):
+                        d_text = clean_text(cells[date_col_idx].get_text(" ", strip=True))
+                        if d_text:
+                            row_meta["date"] = d_text
+
                     for a in row.find_all("a", href=True):
                         raw_href = a["href"].strip()
+                        link_text = clean_text(a.get_text(" ", strip=True))
+                        title = first_cell_text if len(first_cell_text) > 3 else (link_text or PurePosixPath(urlparse(page_url).path).name)
+                        filename = safe_filename(title)
+                        row_meta["title"] = title
+
+                        # 1. Support ASP.NET __doPostBack LinkButtons (e.g., WBCSC SET Question Papers)
+                        m_post = POSTBACK_RE.search(unescape(raw_href))
+                        if m_post:
+                            target, arg = m_post.group(1), m_post.group(2)
+                            if any(w in link_text.lower() for w in ("download", "view", "pdf", "lnkdelete", "lnkdownload", "click")) or any(w in first_cell_text.lower() for w in ("paper", "general", "set", "syllabus", "subject")):
+                                self.download_aspnet_postback(page_url, soup, target, arg, filename, meta=row_meta, page_title=title)
+                                continue
+
                         if not raw_href or raw_href.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
                             continue
                         href = urljoin(page_url, raw_href)
                         if urlparse(href).scheme not in ("http", "https"):
                             continue
-                        link_text = clean_text(a.get_text(" ", strip=True))
-                        # Identify PDF by extension or viewer text
                         if is_pdf_url(href) or any(w in link_text.lower() for w in ("view(", "accessible version", "download", "pdf")):
-                            first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
-                            title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(urlparse(href).path).name
-                            filename = safe_filename(title)
-
-                            row_meta = dict(page_meta)
-                            row_meta["title"] = title
-                            if date_col_idx != -1 and date_col_idx < len(cells):
-                                d_text = clean_text(cells[date_col_idx].get_text(" ", strip=True))
-                                if d_text:
-                                    row_meta["date"] = d_text
-
                             self.download_pdf(href, filename, page_url, meta=row_meta, page_title=title)
 
         # 2. Parse any direct PDF links outside tables
@@ -400,6 +428,10 @@ class WebDownloader:
                     continue
                 if href not in self.visited and not any(href == q_url for q_url, _ in queue):
                     queue.append((href, depth + 1))
+
+        # 4. Automatic ASP.NET Dropdown Session Exploration (e.g. WBCSC SETQuestionPaper.aspx)
+        if depth < self.max_depth and (page_url.lower().endswith(".aspx") or soup.find("input", attrs={"name": "__VIEWSTATE"})):
+            self.process_aspnet_dropdowns(soup, page_url, queue, depth)
 
     def extract_dspace_pdf_links(self, soup: BeautifulSoup, page_url: str):
         found = []
