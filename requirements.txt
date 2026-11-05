@@ -3,3 +3,4 @@ requests
 beautifulsoup4
 urllib3
 pypdf
+pandas
