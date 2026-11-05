@@ -2,10 +2,8 @@
 """
 Universal Bulk PDF Downloader - Streamlit Web App
 -------------------------------------------------
-Web interface for extracting PDFs from eGyanKosh (DSpace), government portals
-(like NTA / S3WaaS), and general websites.
-
-Deployable to Streamlit Community Cloud (share.streamlit.io).
+Vibrant, colorful web interface styled after OmniWare educational portal.
+Supports DSpace repositories, government portals (NTA / S3WaaS), and general websites.
 """
 
 from __future__ import annotations
@@ -27,7 +25,14 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# Suppress insecure SSL warnings for government/educational sites
+# Optional pypdf for reading internal PDF metadata
+try:
+    import pypdf
+    HAS_PYPDF = True
+except Exception:
+    HAS_PYPDF = False
+
+# Suppress insecure SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 USER_AGENT = (
@@ -79,6 +84,34 @@ def normalize_host(netloc: str) -> str:
 
 def same_site(url: str, host: str) -> bool:
     return normalize_host(urlparse(url).netloc) == normalize_host(host)
+
+
+def extract_pdf_file_metadata(pdf_path: Path) -> dict:
+    """Reads embedded author, title, creation date, and subject directly from PDF."""
+    info = {}
+    if HAS_PYPDF and pdf_path.exists():
+        try:
+            reader = pypdf.PdfReader(pdf_path)
+            raw = reader.metadata or {}
+            if raw.get("/Title"):
+                info["title"] = clean_text(str(raw.get("/Title")))
+            if raw.get("/Author"):
+                info["authors"] = clean_text(str(raw.get("/Author")))
+            if raw.get("/Subject"):
+                info["subject"] = clean_text(str(raw.get("/Subject")))
+            if raw.get("/CreationDate"):
+                d = str(raw.get("/CreationDate"))
+                # PDF dates usually look like D:YYYYMMDDHHmmSS
+                m = re.search(r"(\d{4})(\d{2})(\d{2})", d)
+                if m:
+                    info["date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                else:
+                    info["date"] = d
+            if raw.get("/Creator") or raw.get("/Producer"):
+                info["publisher"] = clean_text(str(raw.get("/Creator") or raw.get("/Producer")))
+        except Exception:
+            pass
+    return info
 
 
 @dataclass
@@ -163,8 +196,8 @@ class WebDownloader:
         else:
             self.is_dspace_repo = False
 
-        engine_name = "DSpace Repository Engine (eGyanKosh)" if self.is_dspace_repo else "Document Portal Engine (NTA / Web)"
-        self.log(f"🔎 **Engine Detected:** {engine_name}")
+        engine_name = "DSpace Academic Engine" if self.is_dspace_repo else "Document Portal Engine"
+        self.log(f"🔎 **Active Engine:** {engine_name}")
 
     def crawl(self, progress_bar=None):
         queue = deque([(self.start_url, 0)])
@@ -187,9 +220,10 @@ class WebDownloader:
                 response = self.get(url)
                 content_type = response.headers.get("content-type", "").lower()
 
+                # Direct PDF URL
                 if "application/pdf" in content_type or url.lower().endswith(".pdf"):
                     filename = safe_filename(PurePosixPath(urlparse(url).path).name)
-                    self.download_pdf(url, filename, url, page_title="Direct PDF Link")
+                    self.download_pdf(url, filename, url, page_title=filename[:-4], meta={})
                     continue
 
                 if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -200,7 +234,7 @@ class WebDownloader:
                     self.detect_mode(soup, response.url)
                     first_page = False
 
-                self.log(f"📄 Page {len(self.visited)}: `{url}`")
+                self.log(f"📄 Explored: `{url}`")
 
                 if self.is_dspace_repo:
                     self.process_dspace(soup, response.url, queue, depth)
@@ -233,23 +267,66 @@ class WebDownloader:
                 if child_url not in self.visited:
                     queue.append((child_url, depth + 1))
 
+    def extract_generic_page_metadata(self, soup: BeautifulSoup, page_url: str) -> dict:
+        """Extracts Dublin Core, OpenGraph, and standard meta tags from standalone pages."""
+        meta = {}
+        meta["title"] = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+        meta["publisher"] = urlparse(page_url).netloc
+
+        for tag in soup.find_all("meta"):
+            name = (tag.get("name") or tag.get("property") or "").lower()
+            content = clean_text(tag.get("content", ""))
+            if not content:
+                continue
+
+            if name in ("description", "og:description", "twitter:description", "dc.description"):
+                meta.setdefault("description", content)
+            elif name in ("author", "article:author", "dc.creator", "dc.contributor"):
+                meta.setdefault("authors", content)
+            elif name in ("date", "pubdate", "article:published_time", "dc.date", "dc.date.issued"):
+                meta.setdefault("date", content)
+            elif name in ("publisher", "og:site_name", "dc.publisher"):
+                meta["publisher"] = content
+            elif name in ("keywords", "subject", "dc.subject"):
+                meta.setdefault("subject", content)
+            elif name in ("language", "dc.language", "og:locale"):
+                meta.setdefault("language", content)
+
+        return meta
+
     def process_generic(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
-        page_title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+        page_meta = self.extract_generic_page_metadata(soup, page_url)
 
-        # 1. Parse tables for titles (common on government and archive sites)
-        for row in soup.find_all("tr"):
-            cells = row.find_all(["td", "th"])
-            if len(cells) >= 2:
-                for a in row.find_all("a", href=True):
-                    href = urljoin(page_url, a["href"])
-                    u = urlparse(href)
-                    if u.path.lower().endswith(".pdf") or ".pdf?" in href.lower():
-                        first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
-                        title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(u.path).name
-                        filename = safe_filename(title)
-                        self.download_pdf(href, filename, page_url, page_title=title)
+        # 1. Parse tables: extract title, date, and PDF link from rows
+        for table in soup.find_all("table"):
+            headers = [clean_text(th.get_text(" ", strip=True)).lower() for th in table.find_all("th")]
+            date_col_idx = -1
+            for idx, h in enumerate(headers):
+                if any(w in h for w in ("date", "year", "published", "issue")):
+                    date_col_idx = idx
+                    break
 
-        # 2. Parse any direct PDF links on the page
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) >= 2:
+                    for a in row.find_all("a", href=True):
+                        href = urljoin(page_url, a["href"])
+                        u = urlparse(href)
+                        if u.path.lower().endswith(".pdf") or ".pdf?" in href.lower():
+                            first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
+                            title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(u.path).name
+                            filename = safe_filename(title)
+
+                            row_meta = dict(page_meta)
+                            row_meta["title"] = title
+                            if date_col_idx != -1 and date_col_idx < len(cells):
+                                d_text = clean_text(cells[date_col_idx].get_text(" ", strip=True))
+                                if d_text:
+                                    row_meta["date"] = d_text
+
+                            self.download_pdf(href, filename, page_url, meta=row_meta, page_title=title)
+
+        # 2. Parse any direct PDF links outside tables
         for a in soup.find_all("a", href=True):
             href = urljoin(page_url, a["href"])
             u = urlparse(href)
@@ -257,7 +334,10 @@ class WebDownloader:
                 link_text = clean_text(a.get_text(" ", strip=True))
                 raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "download", "view", "link"]) else PurePosixPath(u.path).name
                 filename = safe_filename(raw_name or PurePosixPath(u.path).name)
-                self.download_pdf(href, filename, page_url, page_title=page_title)
+
+                link_meta = dict(page_meta)
+                link_meta["title"] = raw_name or link_meta.get("title", filename)
+                self.download_pdf(href, filename, page_url, meta=link_meta, page_title=link_meta["title"])
 
         # 3. Follow subpages within depth limit
         if depth < self.max_depth:
@@ -371,7 +451,7 @@ class WebDownloader:
             return
         self.pdf_url_seen.add(pdf_url)
 
-        meta = meta or {}
+        meta = dict(meta or {})
         item_title = meta.get("title") or page_title or base_filename
 
         target_path = self.temp_dir / base_filename
@@ -407,16 +487,22 @@ class WebDownloader:
                 target_path.unlink(missing_ok=True)
                 raise ValueError(f"Content is not a PDF (content-type: '{content_type or 'unknown'}')")
 
+            # Extract internal PDF metadata to fill in missing fields (author, date, subject)
+            pdf_internal_meta = extract_pdf_file_metadata(target_path)
+            for k, v in pdf_internal_meta.items():
+                if not meta.get(k) and v:
+                    meta[k] = v
+
             self.downloaded_files.append((filename, target_path, pdf_url))
             self.records.append(DownloadRecord(
-                title=item_title,
+                title=meta.get("title") or item_title,
                 authors=meta.get("authors", ""),
                 date=meta.get("date", ""),
                 publisher=meta.get("publisher", ""),
                 subject=meta.get("subject", ""),
                 description=meta.get("description", ""),
                 language=meta.get("language", ""),
-                item_type=meta.get("type", ""),
+                item_type=meta.get("type", "PDF Document"),
                 page_url=page_url,
                 pdf_url=pdf_url,
                 filename=filename,
@@ -434,7 +520,7 @@ class WebDownloader:
                 subject=meta.get("subject", ""),
                 description=meta.get("description", ""),
                 language=meta.get("language", ""),
-                item_type=meta.get("type", ""),
+                item_type=meta.get("type", "PDF Document"),
                 page_url=page_url,
                 pdf_url=pdf_url,
                 filename=filename,
@@ -468,47 +554,465 @@ def build_zip_in_memory(downloaded_files, records) -> bytes:
 
 
 # -------------------------------------------------------------
-# Streamlit UI
+# Streamlit UI with OmniWare Styling
 # -------------------------------------------------------------
 st.set_page_config(
-    page_title="Universal Bulk PDF Extractor",
-    page_icon="📚",
+    page_title="OmniWare • Universal Bulk PDF Extractor",
+    page_icon="🎓",
     layout="wide",
 )
 
-st.title("📚 Universal Bulk PDF Extractor")
+# Custom CSS matching the colorful OmniWare theme
 st.markdown(
-    "Extract and download PDFs in bulk from **eGyanKosh (IGNOU / DSpace)**, "
-    "**government exam portals (NTA / JEE / S3WaaS)**, and general websites."
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+    /* Global background */
+    .stApp {
+        background: #f4f7fb;
+        font-family: 'Plus Jakarta Sans', sans-serif;
+    }
+
+    /* Top Navy & Gold Banner */
+    .omni-top-banner {
+        background: linear-gradient(135deg, #02163b 0%, #062b66 50%, #031c49 100%);
+        border-bottom: 3px solid #d4af37;
+        padding: 16px 28px;
+        border-radius: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 20px;
+        box-shadow: 0 8px 24px rgba(3, 27, 73, 0.15);
+    }
+    .omni-brand-left {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+    }
+    .omni-logo-badge {
+        background: radial-gradient(circle, #ffe082 0%, #d4af37 100%);
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 28px;
+        box-shadow: 0 4px 12px rgba(212, 175, 55, 0.4);
+    }
+    .omni-brand-title {
+        font-family: 'Cinzel', serif;
+        font-size: 32px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #f7d784;
+        margin: 0;
+        line-height: 1.1;
+    }
+    .omni-brand-sub {
+        font-size: 13px;
+        font-weight: 500;
+        color: #f4f7fb;
+        margin: 0;
+        letter-spacing: 0.8px;
+    }
+    .omni-tagline {
+        font-family: 'Cinzel', serif;
+        font-style: italic;
+        color: #ffd54f;
+        font-size: 17px;
+        letter-spacing: 1px;
+    }
+    .omni-designer {
+        font-size: 12px;
+        color: #b0c4de;
+    }
+    .omni-user-badge {
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        padding: 8px 16px;
+        border-radius: 30px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    /* Sub Profile Banner */
+    .profile-banner {
+        background: #dbeffe;
+        border: 1px solid #bfdbfe;
+        border-radius: 14px;
+        padding: 14px 22px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 22px;
+        box-shadow: 0 2px 8px rgba(30, 64, 175, 0.05);
+    }
+    .profile-info {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+    }
+    .profile-icon {
+        background: #1e40af;
+        color: white;
+        width: 44px;
+        height: 44px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 22px;
+    }
+    .profile-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #0f172a;
+        margin: 0;
+    }
+    .profile-sub {
+        font-size: 13px;
+        color: #334155;
+        margin: 0;
+    }
+
+    /* Section Header */
+    .section-header-bar {
+        background: linear-gradient(90deg, #0d3b84 0%, #1e58b8 100%);
+        color: white;
+        padding: 10px 18px;
+        border-radius: 10px 10px 0 0;
+        font-weight: 700;
+        font-size: 16px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .section-container {
+        background: white;
+        border: 1px solid #e2e8f0;
+        border-radius: 0 0 14px 14px;
+        padding: 20px;
+        margin-bottom: 22px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+    }
+
+    /* Colorful Feature Cards */
+    .feature-card {
+        border-radius: 16px;
+        padding: 20px 16px;
+        text-align: center;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        align-items: center;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+    }
+    .feature-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.1);
+    }
+    .card-icon {
+        width: 52px;
+        height: 52px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 26px;
+        margin-bottom: 12px;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+    }
+    .card-title {
+        font-size: 16px;
+        font-weight: 800;
+        margin-bottom: 4px;
+    }
+    .card-sub {
+        font-size: 12px;
+        font-weight: 500;
+        margin-bottom: 14px;
+    }
+    .card-btn {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        font-weight: bold;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    }
+
+    /* Color variations matching the image */
+    .card-blue {
+        background: linear-gradient(180deg, #dbeafe 0%, #bfdbfe 100%);
+        border: 1px solid #93c5fd;
+        color: #1e3a8a;
+    }
+    .card-blue .card-icon { background: #2563eb; color: white; }
+    .card-blue .card-title { color: #1e3a8a; }
+    .card-blue .card-sub { color: #1d4ed8; }
+    .card-blue .card-btn { color: #2563eb; }
+
+    .card-green {
+        background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
+        border: 1px solid #86efac;
+        color: #14532d;
+    }
+    .card-green .card-icon { background: #16a34a; color: white; }
+    .card-green .card-title { color: #14532d; }
+    .card-green .card-sub { color: #15803d; }
+    .card-green .card-btn { color: #16a34a; }
+
+    .card-orange {
+        background: linear-gradient(180deg, #ffedd5 0%, #fed7aa 100%);
+        border: 1px solid #fdba74;
+        color: #7c2d12;
+    }
+    .card-orange .card-icon { background: #ea580c; color: white; }
+    .card-orange .card-title { color: #7c2d12; }
+    .card-orange .card-sub { color: #c2410c; }
+    .card-orange .card-btn { color: #ea580c; }
+
+    .card-purple {
+        background: linear-gradient(180deg, #f3e8ff 0%, #e9d5ff 100%);
+        border: 1px solid #d8b4fe;
+        color: #581c87;
+    }
+    .card-purple .card-icon { background: #9333ea; color: white; }
+    .card-purple .card-title { color: #581c87; }
+    .card-purple .card-sub { color: #7e22ce; }
+    .card-purple .card-btn { color: #9333ea; }
+
+    .card-teal {
+        background: linear-gradient(180deg, #ccfbf1 0%, #99f6e4 100%);
+        border: 1px solid #5eead4;
+        color: #134e4a;
+    }
+    .card-teal .card-icon { background: #0d9488; color: white; }
+    .card-teal .card-title { color: #134e4a; }
+    .card-teal .card-sub { color: #0f766e; }
+    .card-teal .card-btn { color: #0d9488; }
+
+    /* Recommendation warm banner */
+    .rec-banner {
+        background: #fffbeb;
+        border: 1px solid #fde68a;
+        border-radius: 12px;
+        padding: 14px 20px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 18px;
+        margin-bottom: 24px;
+    }
+    .rec-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+    }
+    .rec-star {
+        font-size: 26px;
+        color: #f59e0b;
+    }
+    .rec-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #78350f;
+        margin: 0;
+    }
+    .rec-sub {
+        font-size: 13px;
+        color: #92400e;
+        margin: 0;
+    }
+
+    /* Footer Banner */
+    .omni-footer {
+        background: #02163b;
+        color: #ffd54f;
+        text-align: center;
+        padding: 12px;
+        border-radius: 8px;
+        font-family: 'Cinzel', serif;
+        font-style: italic;
+        font-size: 15px;
+        letter-spacing: 1px;
+        margin-top: 24px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
+# 1. Top Navigation & Brand Banner (Matching the OmniWare theme)
+st.markdown(
+    """
+    <div class="omni-top-banner">
+        <div class="omni-brand-left">
+            <div class="omni-logo-badge">🎓</div>
+            <div>
+                <h1 class="omni-brand-title">OmniWare</h1>
+                <p class="omni-brand-sub">Smart Learning 24x7</p>
+            </div>
+        </div>
+        <div style="text-align: center;">
+            <div class="omni-tagline">Learn • Practice • Excel</div>
+            <div class="omni-designer">Universal PDF Extractor Cloud</div>
+        </div>
+        <div class="omni-user-badge">
+            <span>🔔 2</span>
+            <span>👤 Welcome, User ▾</span>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# 2. Academic Profile / Breadcrumb Card
+st.markdown(
+    """
+    <div class="profile-banner">
+        <div class="profile-info">
+            <div class="profile-icon">🎓</div>
+            <div>
+                <h2 class="profile-title">Bulk PDF Extractor System</h2>
+                <p class="profile-sub">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</p>
+            </div>
+        </div>
+        <div style="background: white; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; color: #1e40af; border: 1px solid #bfdbfe;">
+            📊 Ready to Harvest &gt;
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# 3. Colorful Quick Action Cards (5 vibrant cards matching the image)
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.markdown(
+        """
+        <div class="feature-card card-blue">
+            <div class="card-icon">💬</div>
+            <div>
+                <div class="card-title">Paste URL</div>
+                <div class="card-sub">Link • Detect • Target</div>
+            </div>
+            <div class="card-btn">→</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col2:
+    st.markdown(
+        """
+        <div class="feature-card card-green">
+            <div class="card-icon">📖</div>
+            <div>
+                <div class="card-title">Deep Crawl</div>
+                <div class="card-sub">Recursive • Sublinks</div>
+            </div>
+            <div class="card-btn">→</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col3:
+    st.markdown(
+        """
+        <div class="feature-card card-orange">
+            <div class="card-icon">📋</div>
+            <div>
+                <div class="card-title">Auto Stream</div>
+                <div class="card-sub">Extract • Stream • Verify</div>
+            </div>
+            <div class="card-btn">→</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col4:
+    st.markdown(
+        """
+        <div class="feature-card card-purple">
+            <div class="card-icon">📚</div>
+            <div>
+                <div class="card-title">Full Metadata</div>
+                <div class="card-sub">Author • Date • Manifest</div>
+            </div>
+            <div class="card-btn">→</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+with col5:
+    st.markdown(
+        """
+        <div class="feature-card card-teal">
+            <div class="card-icon">📈</div>
+            <div>
+                <div class="card-title">ZIP Export</div>
+                <div class="card-sub">1-Click • Bundle • Save</div>
+            </div>
+            <div class="card-btn">→</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.write("")
+
+# 4. Main Crawler Interface
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("⚙️ Crawler Settings")
+    # Requirement 2: Default to "Deep Crawl (Follow sublinks)"
     crawl_mode = st.radio(
         "Crawl Mode",
-        options=["Current Page Only", "Deep Crawl (Follow sublinks)"],
-        index=0,
-        help="Use 'Current Page Only' for notice or archive pages (like NTA page 11). Use 'Deep Crawl' for complete eGyanKosh courses.",
+        options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
+        index=0,  # Deep Crawl is default!
+        help="'Deep Crawl' explores course blocks and connected subpages. 'Current Page Only' targets just the provided URL.",
     )
-    max_depth = 0 if crawl_mode == "Current Page Only" else 2
-    max_pages = st.number_input("Maximum Pages to Crawl", min_value=1, max_value=200, value=25)
+    max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
+    max_pages = st.number_input("Maximum Pages to Crawl", min_value=1, max_value=300, value=30)
     request_delay = st.slider("Request Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-target_url = st.text_input(
-    "🔗 Enter URL to extract PDFs from:",
-    placeholder="e.g. https://jeemain.nta.nic.in/document-category/archive/page/11/ or https://egyankosh.ac.in/handle/123456789/72701",
-)
+st.markdown('<div class="section-header-bar">🚀 Continue Extraction</div>', unsafe_allow_html=True)
+with st.container():
+    st.markdown('<div class="section-container">', unsafe_allow_html=True)
+    target_url = st.text_input(
+        "🔗 Paste Repository, Archive, or Webpage URL:",
+        placeholder="https://egyankosh.ac.in/handle/123456789/... or https://jeemain.nta.nic.in/document-category/archive/page/11/",
+    )
+    start_btn = st.button("🚀 Start PDF Extraction", type="primary", use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-if st.button("🚀 Start PDF Extraction", type="primary"):
+if start_btn:
     if not target_url.strip():
-        st.warning("Please enter a valid URL.")
+        st.warning("Please provide a valid URL to begin.")
     else:
         url = target_url.strip().strip("'\"")
         if not urlparse(url).scheme:
             url = "https://" + url
 
         with tempfile.TemporaryDirectory(prefix="pdf_extract_") as temp_dir:
-            status_box = st.status("🔍 Initializing crawler...", expanded=True)
+            status_box = st.status("🔍 Initializing OmniWare crawler engine...", expanded=True)
             downloader = WebDownloader(
                 start_url=url,
                 delay=request_delay,
@@ -521,36 +1025,100 @@ if st.button("🚀 Start PDF Extraction", type="primary"):
             progress_bar = st.progress(0.0)
             downloader.crawl(progress_bar=progress_bar)
             progress_bar.progress(1.0)
-            status_box.update(label="✅ Extraction Completed!", state="complete", expanded=False)
+            status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
 
             downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
             failed_count = sum(1 for r in downloader.records if r.status == "Failed")
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Pages Visited", len(downloader.visited))
-            col2.metric("PDFs Downloaded", downloaded_count)
-            col3.metric("Failed Downloads", failed_count)
+            # Colorful metrics row
+            mcol1, mcol2, mcol3 = st.columns(3)
+            with mcol1:
+                st.markdown(
+                    f"""
+                    <div style="background: #dbeafe; border-radius: 12px; padding: 16px; border-left: 6px solid #2563eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
+                        <div style="font-size: 13px; font-weight: 700; color: #1e40af;">PAGES VISITED</div>
+                        <div style="font-size: 32px; font-weight: 800; color: #1e3a8a;">{len(downloader.visited)}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with mcol2:
+                st.markdown(
+                    f"""
+                    <div style="background: #dcfce7; border-radius: 12px; padding: 16px; border-left: 6px solid #16a34a; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
+                        <div style="font-size: 13px; font-weight: 700; color: #15803d;">PDFs HARVESTED</div>
+                        <div style="font-size: 32px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with mcol3:
+                st.markdown(
+                    f"""
+                    <div style="background: #fee2e2; border-radius: 12px; padding: 16px; border-left: 6px solid #dc2626; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
+                        <div style="font-size: 13px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
+                        <div style="font-size: 32px; font-weight: 800; color: #991b1b;">{failed_count}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.write("")
 
             if downloaded_count > 0:
                 zip_data = build_zip_in_memory(downloader.downloaded_files, downloader.records)
+
                 st.download_button(
-                    label="📥 Download All Extracted PDFs (ZIP)",
+                    label="📥 Download All Harvested PDFs + Metadata (ZIP)",
                     data=zip_data,
-                    file_name="extracted_pdfs.zip",
+                    file_name="harvested_pdfs.zip",
                     mime="application/zip",
                     type="primary",
+                    use_container_width=True,
                 )
 
-                st.subheader("📋 Downloaded Files Manifest")
-                summary_data = [
+                st.subheader("📋 Document Manifest & Metadata")
+                manifest_view = [
                     {
-                        "Filename": r.filename,
-                        "Title": r.title,
+                        "Document Title": r.title,
+                        "Author / Contributor": r.authors or "—",
+                        "Issue Date": r.date or "—",
+                        "Publisher / Source": r.publisher or "—",
+                        "File Name": r.filename,
                         "Size (KB)": round(r.size_bytes / 1024, 1),
                         "Status": r.status,
                     }
                     for r in downloader.records
                 ]
-                st.dataframe(summary_data, use_container_width=True)
+                st.dataframe(manifest_view, use_container_width=True)
             else:
-                st.info("No PDF files were found at the provided URL.")
+                st.info("No PDF documents were located at the provided target.")
+
+# 5. Recommendation / Tip Banner (matching the warm yellow banner)
+st.markdown(
+    """
+    <div class="rec-banner">
+        <div class="rec-left">
+            <span class="rec-star">★</span>
+            <div>
+                <p class="rec-title">Pro Tip for Educational Archives</p>
+                <p class="rec-sub">For eGyanKosh course blocks, use 'Deep Crawl'. For single notice/circular tables (like NTA Page 11), switch to 'Current Page Only'.</p>
+            </div>
+        </div>
+        <div style="background: white; border: 1px solid #fcd34d; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; color: #b45309;">
+            💡 Smart Tip
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# 6. Navy & Gold Bottom Banner
+st.markdown(
+    """
+    <div class="omni-footer">
+        Knowledge Today... Success Tomorrow...
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
