@@ -560,6 +560,21 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <head>
+        <title>PDF Extractor</title>
+        <meta property="og:title" content="PDF Extractor" />
+        <meta property="og:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
+        <meta property="og:site_name" content="PDF Extractor" />
+        <meta property="og:type" content="website" />
+        <meta name="twitter:title" content="PDF Extractor" />
+        <meta name="twitter:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
+    </head>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Custom Styling
 st.markdown(
     """
@@ -601,14 +616,45 @@ st.markdown(
         font-size: 24px;
         box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
-    /* Title: PDF Extractor in Golden / White */
-    .system-title {
-        font-family: 'Cinzel', serif;
-        font-size: 28px;
-        font-weight: 800;
-        color: #f7d784;
-        margin: 0;
-        letter-spacing: 1px;
+    /* Title: PDF Extractor in Brilliant Golden */
+    /* Force dark, readable font on ALL widgets (radio, slider, number input, expander) across light & dark mode / mobile */
+    .stRadio label, .stRadio div, .stRadio p, .stRadio span {
+        color: #0f172a !important;
+        font-weight: 600 !important;
+    }
+    .stSlider label, .stSlider div, .stSlider p, .stSlider span {
+        color: #0f172a !important;
+        font-weight: 600 !important;
+    }
+    .stNumberInput label, .stNumberInput div, .stNumberInput p, .stNumberInput span, .stNumberInput input {
+        color: #0f172a !important;
+        font-weight: 600 !important;
+    }
+    .streamlit-expanderHeader, [data-testid="stExpander"] summary, [data-testid="stExpander"] details summary p {
+        color: #0f172a !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stExpander"] {
+        background-color: #f8faff !important;
+        border: 1px solid #bfdbfe !important;
+        border-radius: 10px !important;
+    }
+    [data-testid="stExpander"] * {
+        color: #0f172a !important;
+    }
+
+    .system-title,
+    h1.system-title,
+    div.system-title,
+    .stApp .system-title {
+        font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important;
+        font-size: 30px !important;
+        font-weight: 800 !important;
+        color: #ffd700 !important;
+        -webkit-text-fill-color: #ffd700 !important;
+        margin: 0 !important;
+        letter-spacing: 1px !important;
+        text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5) !important;
     }
     .system-subtitle {
         font-size: 13px;
@@ -736,8 +782,8 @@ st.markdown(
         <div class="system-header-left">
             <div class="system-header-icon">🎓</div>
             <div>
-                <h1 class="system-title">PDF Extractor</h1>
-                <p class="system-subtitle">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</p>
+                <div class="system-title" style="color: #ffd700 !important; -webkit-text-fill-color: #ffd700 !important; font-size: 30px !important; font-weight: 800 !important; font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important; letter-spacing: 1px !important; text-shadow: 0 2px 10px rgba(0,0,0,0.5) !important;">PDF Extractor</div>
+                <div class="system-subtitle" style="color: #ffffff !important; font-size: 13px !important; font-weight: 500 !important; margin-top: 4px !important;">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</div>
             </div>
         </div>
         <div class="system-badge-right">
