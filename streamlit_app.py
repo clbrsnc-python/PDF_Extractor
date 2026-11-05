@@ -53,15 +53,65 @@ def clean_text(value: str) -> str:
     return re.sub(r"\s+", " ", unescape(value or "")).strip()
 
 
-def safe_filename(name: str, fallback: str = "download.pdf") -> str:
+DOC_EXTENSIONS = {".pdf", ".doc", ".docx", ".rtf", ".odt", ".ppt", ".pptx", ".xls", ".xlsx"}
+
+def detect_document_format(signature: bytes, path_or_name: str, content_type: str = "") -> tuple[str, str]:
+    sig = signature[:1024]
+    name_lower = path_or_name.lower()
+    ct_lower = content_type.lower()
+
+    if b"%PDF-" in sig:
+        return "PDF Document", ".pdf"
+    if sig.startswith(b"PK"):
+        if ".docx" in name_lower or "word" in ct_lower:
+            return "Word Document (.docx)", ".docx"
+        elif ".pptx" in name_lower or "presentation" in ct_lower:
+            return "PowerPoint Presentation (.pptx)", ".pptx"
+        elif ".xlsx" in name_lower or "spreadsheet" in ct_lower:
+            return "Excel Spreadsheet (.xlsx)", ".xlsx"
+        ext = Path(path_or_name).suffix.lower()
+        return "Office Document", ext if ext in DOC_EXTENSIONS else ".docx"
+    if sig.startswith(bytes([0xd0, 0xcf, 0x11, 0xe0])):
+        if ".doc" in name_lower or "msword" in ct_lower or "word" in ct_lower:
+            return "Word Document (.doc)", ".doc"
+        elif ".ppt" in name_lower:
+            return "PowerPoint (.ppt)", ".ppt"
+        return "Word Document (.doc)", ".doc"
+    if sig.startswith(b"{\rtf"):
+        return "Rich Text (.rtf)", ".rtf"
+    
+    # Fallback by content type or name
+    if "application/pdf" in ct_lower or name_lower.endswith(".pdf"):
+        return "PDF Document", ".pdf"
+    if "word" in ct_lower or name_lower.endswith(".docx"):
+        return "Word Document (.docx)", ".docx"
+    if name_lower.endswith(".doc"):
+        return "Word Document (.doc)", ".doc"
+
+    return "", ""
+
+def is_academic_doc_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) or f"{ext}?" in url.lower() for ext in (".pdf", ".doc", ".docx", ".rtf", ".odt", ".ppt", ".pptx")) or "/bitstream/" in path
+
+def safe_filename(name: str, fallback: str = "document.pdf", default_ext: str = ".pdf") -> str:
     name = unquote(name or "").strip()
     name = BAD_CHARS.sub("_", name)
     name = name.strip(" .")
     if not name:
         name = fallback
-    if not name.lower().endswith(".pdf"):
-        name += ".pdf"
-    return name[:180]
+
+    ext = Path(name).suffix.lower()
+    if ext in DOC_EXTENSIONS:
+        stem = name[:-len(ext)]
+        if stem.upper() in WINDOWS_RESERVED:
+            name = f"doc_{name}"
+        return name[:180]
+
+    stem = name
+    if stem.upper() in WINDOWS_RESERVED:
+        stem = f"doc_{stem}"
+    return f"{stem}{default_ext}"[:180]
 
 
 def clean_url(url: str) -> str:
@@ -219,10 +269,12 @@ class WebDownloader:
                 response = self.get(url)
                 content_type = response.headers.get("content-type", "").lower()
 
-                # Direct PDF URL
-                if "application/pdf" in content_type or url.lower().endswith(".pdf"):
-                    filename = safe_filename(PurePosixPath(urlparse(url).path).name)
-                    self.download_pdf(url, filename, url, page_title=filename[:-4], meta={})
+                # Direct PDF or Document URL
+                if any(ct in content_type for ct in ("application/pdf", "msword", "wordprocessingml", "opendocument")) or any(url.lower().endswith(ext) for ext in (".pdf", ".doc", ".docx", ".rtf")):
+                    raw_name = PurePosixPath(urlparse(url).path).name
+                    ext = Path(raw_name).suffix.lower() or ".pdf"
+                    filename = safe_filename(raw_name, default_ext=ext)
+                    self.download_pdf(url, filename, url, page_title=filename, meta={})
                     continue
 
                 if "text/html" not in content_type and "application/xhtml" not in content_type:
@@ -310,10 +362,13 @@ class WebDownloader:
                     for a in row.find_all("a", href=True):
                         href = urljoin(page_url, a["href"])
                         u = urlparse(href)
-                        if u.path.lower().endswith(".pdf") or ".pdf?" in href.lower():
+                        if is_academic_doc_url(href):
                             first_cell_text = clean_text(cells[0].get_text(" ", strip=True))
+                            ext = Path(u.path).suffix.lower()
+                            if ext not in DOC_EXTENSIONS:
+                                ext = ".docx" if ".docx" in href.lower() else (".doc" if ".doc" in href.lower() else ".pdf")
                             title = first_cell_text if len(first_cell_text) > 3 else PurePosixPath(u.path).name
-                            filename = safe_filename(title)
+                            filename = safe_filename(title, default_ext=ext)
 
                             row_meta = dict(page_meta)
                             row_meta["title"] = title
@@ -328,10 +383,13 @@ class WebDownloader:
         for a in soup.find_all("a", href=True):
             href = urljoin(page_url, a["href"])
             u = urlparse(href)
-            if u.path.lower().endswith(".pdf") or ".pdf?" in href.lower():
+            if is_academic_doc_url(href):
                 link_text = clean_text(a.get_text(" ", strip=True))
-                raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "download", "view", "link"]) else PurePosixPath(u.path).name
-                filename = safe_filename(raw_name or PurePosixPath(u.path).name)
+                ext = Path(u.path).suffix.lower()
+                if ext not in DOC_EXTENSIONS:
+                    ext = ".docx" if ".docx" in href.lower() else (".doc" if ".doc" in href.lower() else ".pdf")
+                raw_name = link_text if link_text and not any(w in link_text.lower() for w in ["pdf", "doc", "download", "view", "link"]) else PurePosixPath(u.path).name
+                filename = safe_filename(raw_name or PurePosixPath(u.path).name, default_ext=ext)
 
                 link_meta = dict(page_meta)
                 link_meta["title"] = raw_name or link_meta.get("title", filename)
@@ -452,11 +510,12 @@ class WebDownloader:
         meta = dict(meta or {})
         item_title = meta.get("title") or page_title or base_filename
 
+        current_ext = Path(base_filename).suffix.lower() or ".pdf"
+        stem = base_filename[:-len(current_ext)] if base_filename.lower().endswith(current_ext) else base_filename
         target_path = self.temp_dir / base_filename
         counter = 2
-        stem = base_filename[:-4]
         while target_path.exists() and target_path not in [p for _, p, _ in self.downloaded_files]:
-            target_path = self.temp_dir / f"{stem}_{counter}.pdf"
+            target_path = self.temp_dir / f"{stem}_{counter}{current_ext}"
             counter += 1
 
         filename = target_path.name
@@ -481,15 +540,25 @@ class WebDownloader:
                     total += len(chunk)
             response.close()
 
-            if b"%PDF-" not in signature:
+            # Multi-format validation (PDF, DOC, DOCX, RTF, PPT)
+            doc_type, detected_ext = detect_document_format(signature, target_path.name, content_type)
+            if not doc_type:
                 target_path.unlink(missing_ok=True)
-                raise ValueError(f"Content is not a PDF (content-type: '{content_type or 'unknown'}')")
+                raise ValueError(f"Content is not a recognized document format (content-type: '{content_type or 'unknown'}')")
 
-            # Extract internal PDF metadata to fill in missing fields
-            pdf_internal_meta = extract_pdf_file_metadata(target_path)
-            for k, v in pdf_internal_meta.items():
-                if not meta.get(k) and v:
-                    meta[k] = v
+            # Auto-correct file extension if server returned DOC/DOCX disguised or without extension
+            if detected_ext and target_path.suffix.lower() != detected_ext:
+                corrected_path = target_path.with_suffix(detected_ext)
+                target_path.replace(corrected_path)
+                target_path = corrected_path
+                filename = target_path.name
+
+            # Extract internal PDF metadata if PDF
+            if detected_ext == ".pdf":
+                pdf_internal_meta = extract_pdf_file_metadata(target_path)
+                for k, v in pdf_internal_meta.items():
+                    if not meta.get(k) and v:
+                        meta[k] = v
 
             self.downloaded_files.append((filename, target_path, pdf_url))
             self.records.append(DownloadRecord(
@@ -500,7 +569,7 @@ class WebDownloader:
                 subject=meta.get("subject", ""),
                 description=meta.get("description", ""),
                 language=meta.get("language", ""),
-                item_type=meta.get("type", "PDF Document"),
+                item_type=doc_type or "Document",
                 page_url=page_url,
                 pdf_url=pdf_url,
                 filename=filename,
