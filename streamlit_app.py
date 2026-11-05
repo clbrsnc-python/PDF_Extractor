@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Universal Bulk PDF Downloader - Streamlit Web App
+Universal Bulk PDF Extractor - Streamlit Web App
 -------------------------------------------------
-Vibrant, colorful web interface styled after OmniWare educational portal.
-Supports DSpace repositories, government portals (NTA / S3WaaS), and general websites.
+Streamlined, highlighted interface with compact colorful badges.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ try:
 except Exception:
     HAS_PYPDF = False
 
-# Suppress insecure SSL warnings
+# Suppress insecure SSL warnings for government/educational portals
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 USER_AGENT = (
@@ -101,7 +100,6 @@ def extract_pdf_file_metadata(pdf_path: Path) -> dict:
                 info["subject"] = clean_text(str(raw.get("/Subject")))
             if raw.get("/CreationDate"):
                 d = str(raw.get("/CreationDate"))
-                # PDF dates usually look like D:YYYYMMDDHHmmSS
                 m = re.search(r"(\d{4})(\d{2})(\d{2})", d)
                 if m:
                     info["date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
@@ -554,465 +552,304 @@ def build_zip_in_memory(downloaded_files, records) -> bytes:
 
 
 # -------------------------------------------------------------
-# Streamlit UI with OmniWare Styling
+# Streamlit UI Configuration
 # -------------------------------------------------------------
 st.set_page_config(
-    page_title="OmniWare • Universal Bulk PDF Extractor",
+    page_title="Bulk PDF Extractor System",
     page_icon="🎓",
     layout="wide",
 )
 
-# Custom CSS matching the colorful OmniWare theme
+# Custom Styling
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 
-    /* Global background */
     .stApp {
         background: #f4f7fb;
         font-family: 'Plus Jakarta Sans', sans-serif;
     }
 
-    /* Top Navy & Gold Banner */
-    .omni-top-banner {
-        background: linear-gradient(135deg, #02163b 0%, #062b66 50%, #031c49 100%);
+    /* Main Academic Header */
+    .system-header-card {
+        background: linear-gradient(135deg, #021a44 0%, #082d6c 60%, #031e50 100%);
         border-bottom: 3px solid #d4af37;
-        padding: 16px 28px;
         border-radius: 14px;
+        padding: 20px 26px;
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 24px rgba(3, 27, 73, 0.15);
+        margin-bottom: 22px;
+        box-shadow: 0 6px 20px rgba(2, 26, 68, 0.12);
     }
-    .omni-brand-left {
+    .system-header-left {
         display: flex;
         align-items: center;
         gap: 16px;
     }
-    .omni-logo-badge {
-        background: radial-gradient(circle, #ffe082 0%, #d4af37 100%);
-        width: 52px;
-        height: 52px;
-        border-radius: 50%;
+    .system-header-icon {
+        background: #1e40af;
+        border: 2px solid #60a5fa;
+        color: white;
+        width: 48px;
+        height: 48px;
+        border-radius: 12px;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 28px;
-        box-shadow: 0 4px 12px rgba(212, 175, 55, 0.4);
+        font-size: 26px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
-    .omni-brand-title {
-        font-family: 'Cinzel', serif;
-        font-size: 32px;
+    .system-title {
+        font-size: 24px;
         font-weight: 800;
-        letter-spacing: 0.5px;
-        color: #f7d784;
+        color: #ffffff;
         margin: 0;
-        line-height: 1.1;
+        letter-spacing: 0.3px;
     }
-    .omni-brand-sub {
+    .system-subtitle {
         font-size: 13px;
         font-weight: 500;
-        color: #f4f7fb;
+        color: #bfdbfe;
         margin: 0;
-        letter-spacing: 0.8px;
+        letter-spacing: 0.4px;
     }
-    .omni-tagline {
-        font-family: 'Cinzel', serif;
-        font-style: italic;
-        color: #ffd54f;
-        font-size: 17px;
-        letter-spacing: 1px;
-    }
-    .omni-designer {
-        font-size: 12px;
-        color: #b0c4de;
-    }
-    .omni-user-badge {
-        background: rgba(255, 255, 255, 0.1);
-        border: 1px solid rgba(255, 255, 255, 0.2);
-        padding: 8px 16px;
-        border-radius: 30px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        color: #ffffff;
-        font-size: 14px;
-        font-weight: 600;
-    }
-
-    /* Sub Profile Banner */
-    .profile-banner {
-        background: #dbeffe;
-        border: 1px solid #bfdbfe;
-        border-radius: 14px;
-        padding: 14px 22px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 22px;
-        box-shadow: 0 2px 8px rgba(30, 64, 175, 0.05);
-    }
-    .profile-info {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-    }
-    .profile-icon {
-        background: #1e40af;
-        color: white;
-        width: 44px;
-        height: 44px;
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 22px;
-    }
-    .profile-title {
-        font-size: 18px;
+    .system-badge-right {
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid rgba(255, 255, 255, 0.25);
+        color: #fef08a;
         font-weight: 700;
-        color: #0f172a;
-        margin: 0;
-    }
-    .profile-sub {
         font-size: 13px;
-        color: #334155;
-        margin: 0;
+        padding: 6px 14px;
+        border-radius: 20px;
     }
 
-    /* Section Header */
-    .section-header-bar {
-        background: linear-gradient(90deg, #0d3b84 0%, #1e58b8 100%);
-        color: white;
-        padding: 10px 18px;
-        border-radius: 10px 10px 0 0;
-        font-weight: 700;
-        font-size: 16px;
+    /* PROMINENTLY HIGHLIGHTED URL INPUT CONTAINER */
+    .highlighted-input-box {
+        background: #ffffff;
+        border: 2px solid #2563eb;
+        border-radius: 16px;
+        padding: 24px 26px;
+        margin-bottom: 20px;
+        box-shadow: 0 10px 28px rgba(37, 99, 235, 0.12);
+        position: relative;
+    }
+    .input-label-highlight {
+        font-size: 18px;
+        font-weight: 800;
+        color: #0f172a;
         display: flex;
         align-items: center;
         gap: 8px;
+        margin-bottom: 8px;
     }
-    .section-container {
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 0 0 14px 14px;
-        padding: 20px;
-        margin-bottom: 22px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+    .input-sub-tip {
+        font-size: 13px;
+        color: #64748b;
+        margin-bottom: 14px;
     }
 
-    /* Colorful Feature Cards */
-    .feature-card {
-        border-radius: 16px;
-        padding: 20px 16px;
+    /* COMPACT COLORFUL FEATURE TILES (Reduced Size, No Arrows) */
+    .compact-tile {
+        border-radius: 10px;
+        padding: 10px 12px;
         text-align: center;
         height: 100%;
         display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        align-items: center;
-        transition: transform 0.2s ease, box-shadow 0.2s ease;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
-    }
-    .feature-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 8px 20px rgba(0, 0, 0, 0.1);
-    }
-    .card-icon {
-        width: 52px;
-        height: 52px;
-        border-radius: 12px;
-        display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 26px;
-        margin-bottom: 12px;
-        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.08);
+        gap: 10px;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04);
+        margin-bottom: 20px;
     }
-    .card-title {
-        font-size: 16px;
-        font-weight: 800;
-        margin-bottom: 4px;
+    .tile-icon {
+        font-size: 18px;
+        line-height: 1;
     }
-    .card-sub {
+    .tile-text-wrap {
+        text-align: left;
+    }
+    .tile-title {
         font-size: 12px;
-        font-weight: 500;
-        margin-bottom: 14px;
+        font-weight: 800;
+        line-height: 1.2;
     }
-    .card-btn {
-        width: 32px;
-        height: 32px;
-        border-radius: 50%;
-        background: white;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 16px;
-        font-weight: bold;
-        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+    .tile-desc {
+        font-size: 10px;
+        font-weight: 600;
+        line-height: 1.1;
     }
 
-    /* Color variations matching the image */
-    .card-blue {
-        background: linear-gradient(180deg, #dbeafe 0%, #bfdbfe 100%);
-        border: 1px solid #93c5fd;
-        color: #1e3a8a;
-    }
-    .card-blue .card-icon { background: #2563eb; color: white; }
-    .card-blue .card-title { color: #1e3a8a; }
-    .card-blue .card-sub { color: #1d4ed8; }
-    .card-blue .card-btn { color: #2563eb; }
+    /* Color variations */
+    .tile-blue { background: #e0f2fe; border: 1px solid #bae6fd; color: #0369a1; }
+    .tile-blue .tile-desc { color: #0284c7; }
 
-    .card-green {
-        background: linear-gradient(180deg, #dcfce7 0%, #bbf7d0 100%);
-        border: 1px solid #86efac;
-        color: #14532d;
-    }
-    .card-green .card-icon { background: #16a34a; color: white; }
-    .card-green .card-title { color: #14532d; }
-    .card-green .card-sub { color: #15803d; }
-    .card-green .card-btn { color: #16a34a; }
+    .tile-green { background: #dcfce7; border: 1px solid #bbf7d0; color: #15803d; }
+    .tile-green .tile-desc { color: #16a34a; }
 
-    .card-orange {
-        background: linear-gradient(180deg, #ffedd5 0%, #fed7aa 100%);
-        border: 1px solid #fdba74;
-        color: #7c2d12;
-    }
-    .card-orange .card-icon { background: #ea580c; color: white; }
-    .card-orange .card-title { color: #7c2d12; }
-    .card-orange .card-sub { color: #c2410c; }
-    .card-orange .card-btn { color: #ea580c; }
+    .tile-orange { background: #ffedd5; border: 1px solid #fed7aa; color: #c2410c; }
+    .tile-orange .tile-desc { color: #ea580c; }
 
-    .card-purple {
-        background: linear-gradient(180deg, #f3e8ff 0%, #e9d5ff 100%);
-        border: 1px solid #d8b4fe;
-        color: #581c87;
-    }
-    .card-purple .card-icon { background: #9333ea; color: white; }
-    .card-purple .card-title { color: #581c87; }
-    .card-purple .card-sub { color: #7e22ce; }
-    .card-purple .card-btn { color: #9333ea; }
+    .tile-purple { background: #f3e8ff; border: 1px solid #e9d5ff; color: #7e22ce; }
+    .tile-purple .tile-desc { color: #9333ea; }
 
-    .card-teal {
-        background: linear-gradient(180deg, #ccfbf1 0%, #99f6e4 100%);
-        border: 1px solid #5eead4;
-        color: #134e4a;
-    }
-    .card-teal .card-icon { background: #0d9488; color: white; }
-    .card-teal .card-title { color: #134e4a; }
-    .card-teal .card-sub { color: #0f766e; }
-    .card-teal .card-btn { color: #0d9488; }
-
-    /* Recommendation warm banner */
-    .rec-banner {
-        background: #fffbeb;
-        border: 1px solid #fde68a;
-        border-radius: 12px;
-        padding: 14px 20px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-top: 18px;
-        margin-bottom: 24px;
-    }
-    .rec-left {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-    .rec-star {
-        font-size: 26px;
-        color: #f59e0b;
-    }
-    .rec-title {
-        font-size: 15px;
-        font-weight: 700;
-        color: #78350f;
-        margin: 0;
-    }
-    .rec-sub {
-        font-size: 13px;
-        color: #92400e;
-        margin: 0;
-    }
+    .tile-teal { background: #ccfbf1; border: 1px solid #99f6e4; color: #0f766e; }
+    .tile-teal .tile-desc { color: #0d9488; }
 
     /* Footer Banner */
     .omni-footer {
         background: #02163b;
         color: #ffd54f;
         text-align: center;
-        padding: 12px;
+        padding: 10px;
         border-radius: 8px;
-        font-family: 'Cinzel', serif;
         font-style: italic;
-        font-size: 15px;
-        letter-spacing: 1px;
-        margin-top: 24px;
+        font-size: 14px;
+        letter-spacing: 0.8px;
+        margin-top: 26px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# 1. Top Navigation & Brand Banner (Matching the OmniWare theme)
+# 1. Main System Header (Starts directly with Bulk PDF Extractor System)
 st.markdown(
     """
-    <div class="omni-top-banner">
-        <div class="omni-brand-left">
-            <div class="omni-logo-badge">🎓</div>
+    <div class="system-header-card">
+        <div class="system-header-left">
+            <div class="system-header-icon">🎓</div>
             <div>
-                <h1 class="omni-brand-title">OmniWare</h1>
-                <p class="omni-brand-sub">Smart Learning 24x7</p>
+                <h1 class="system-title">Bulk PDF Extractor System</h1>
+                <p class="system-subtitle">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</p>
             </div>
         </div>
-        <div style="text-align: center;">
-            <div class="omni-tagline">Learn • Practice • Excel</div>
-            <div class="omni-designer">Universal PDF Extractor Cloud</div>
-        </div>
-        <div class="omni-user-badge">
-            <span>🔔 2</span>
-            <span>👤 Welcome, User ▾</span>
+        <div class="system-badge-right">
+            ⚡ Ready to Extract
         </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# 2. Academic Profile / Breadcrumb Card
-st.markdown(
-    """
-    <div class="profile-banner">
-        <div class="profile-info">
-            <div class="profile-icon">🎓</div>
-            <div>
-                <h2 class="profile-title">Bulk PDF Extractor System</h2>
-                <p class="profile-sub">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</p>
-            </div>
-        </div>
-        <div style="background: white; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; color: #1e40af; border: 1px solid #bfdbfe;">
-            📊 Ready to Harvest &gt;
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# 3. Colorful Quick Action Cards (5 vibrant cards matching the image)
-col1, col2, col3, col4, col5 = st.columns(5)
-
-with col1:
-    st.markdown(
-        """
-        <div class="feature-card card-blue">
-            <div class="card-icon">💬</div>
-            <div>
-                <div class="card-title">Paste URL</div>
-                <div class="card-sub">Link • Detect • Target</div>
-            </div>
-            <div class="card-btn">→</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with col2:
-    st.markdown(
-        """
-        <div class="feature-card card-green">
-            <div class="card-icon">📖</div>
-            <div>
-                <div class="card-title">Deep Crawl</div>
-                <div class="card-sub">Recursive • Sublinks</div>
-            </div>
-            <div class="card-btn">→</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with col3:
-    st.markdown(
-        """
-        <div class="feature-card card-orange">
-            <div class="card-icon">📋</div>
-            <div>
-                <div class="card-title">Auto Stream</div>
-                <div class="card-sub">Extract • Stream • Verify</div>
-            </div>
-            <div class="card-btn">→</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with col4:
-    st.markdown(
-        """
-        <div class="feature-card card-purple">
-            <div class="card-icon">📚</div>
-            <div>
-                <div class="card-title">Full Metadata</div>
-                <div class="card-sub">Author • Date • Manifest</div>
-            </div>
-            <div class="card-btn">→</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with col5:
-    st.markdown(
-        """
-        <div class="feature-card card-teal">
-            <div class="card-icon">📈</div>
-            <div>
-                <div class="card-title">ZIP Export</div>
-                <div class="card-sub">1-Click • Bundle • Save</div>
-            </div>
-            <div class="card-btn">→</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-st.write("")
-
-# 4. Main Crawler Interface
+# Sidebar Settings (Default to Deep Crawl)
 with st.sidebar:
     st.header("⚙️ Crawler Settings")
-    # Requirement 2: Default to "Deep Crawl (Follow sublinks)"
     crawl_mode = st.radio(
         "Crawl Mode",
         options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
-        index=0,  # Deep Crawl is default!
+        index=0,  # Deep Crawl is default
         help="'Deep Crawl' explores course blocks and connected subpages. 'Current Page Only' targets just the provided URL.",
     )
     max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
     max_pages = st.number_input("Maximum Pages to Crawl", min_value=1, max_value=300, value=30)
     request_delay = st.slider("Request Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-st.markdown('<div class="section-header-bar">🚀 Continue Extraction</div>', unsafe_allow_html=True)
-with st.container():
-    st.markdown('<div class="section-container">', unsafe_allow_html=True)
-    target_url = st.text_input(
-        "🔗 Paste Repository, Archive, or Webpage URL:",
-        placeholder="https://egyankosh.ac.in/handle/123456789/... or https://jeemain.nta.nic.in/document-category/archive/page/11/",
-    )
-    start_btn = st.button("🚀 Start PDF Extraction", type="primary", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+# 2. PROMINENTLY HIGHLIGHTED URL INPUT SECTION (First and Center)
+st.markdown(
+    """
+    <div class="highlighted-input-box">
+        <div class="input-label-highlight">
+            <span>🔗 Paste Repository, Archive, or Webpage URL:</span>
+        </div>
+        <div class="input-sub-tip">
+            Supports eGyanKosh course units, government archive tables (NTA/JEE), and general PDF resource links.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
+url_col, btn_col = st.columns([4, 1])
+with url_col:
+    target_url = st.text_input(
+        "Enter Target URL",
+        placeholder="https://egyankosh.ac.in/handle/123456789/... or https://jeemain.nta.nic.in/document-category/archive/page/11/",
+        label_visibility="collapsed",
+    )
+with btn_col:
+    start_btn = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
+
+# 3. COMPACT COLORFUL STATUS TILES (Reduced Size, No Arrows)
+tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
+with tcol1:
+    st.markdown(
+        """
+        <div class="compact-tile tile-blue">
+            <span class="tile-icon">🌐</span>
+            <div class="tile-text-wrap">
+                <div class="tile-title">Auto Engine</div>
+                <div class="tile-desc">DSpace / Web</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with tcol2:
+    st.markdown(
+        """
+        <div class="compact-tile tile-green">
+            <span class="tile-icon">🌿</span>
+            <div class="tile-text-wrap">
+                <div class="tile-title">Deep Crawl</div>
+                <div class="tile-desc">Sublink Recursion</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with tcol3:
+    st.markdown(
+        """
+        <div class="compact-tile tile-orange">
+            <span class="tile-icon">⚡</span>
+            <div class="tile-text-wrap">
+                <div class="tile-title">Live Stream</div>
+                <div class="tile-desc">Memory Safe</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with tcol4:
+    st.markdown(
+        """
+        <div class="compact-tile tile-purple">
+            <span class="tile-icon">📚</span>
+            <div class="tile-text-wrap">
+                <div class="tile-title">Metadata</div>
+                <div class="tile-desc">Title • Author • Date</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with tcol5:
+    st.markdown(
+        """
+        <div class="compact-tile tile-teal">
+            <span class="tile-icon">📦</span>
+            <div class="tile-text-wrap">
+                <div class="tile-title">ZIP Export</div>
+                <div class="tile-desc">1-Click Bundle</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# 4. Crawler Execution & Results
 if start_btn:
     if not target_url.strip():
-        st.warning("Please provide a valid URL to begin.")
+        st.warning("Please enter a valid URL to extract PDFs.")
     else:
         url = target_url.strip().strip("'\"")
         if not urlparse(url).scheme:
             url = "https://" + url
 
         with tempfile.TemporaryDirectory(prefix="pdf_extract_") as temp_dir:
-            status_box = st.status("🔍 Initializing OmniWare crawler engine...", expanded=True)
+            status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
             downloader = WebDownloader(
                 start_url=url,
                 delay=request_delay,
@@ -1030,14 +867,14 @@ if start_btn:
             downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
             failed_count = sum(1 for r in downloader.records if r.status == "Failed")
 
-            # Colorful metrics row
+            # Metric KPI Cards
             mcol1, mcol2, mcol3 = st.columns(3)
             with mcol1:
                 st.markdown(
                     f"""
-                    <div style="background: #dbeafe; border-radius: 12px; padding: 16px; border-left: 6px solid #2563eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
-                        <div style="font-size: 13px; font-weight: 700; color: #1e40af;">PAGES VISITED</div>
-                        <div style="font-size: 32px; font-weight: 800; color: #1e3a8a;">{len(downloader.visited)}</div>
+                    <div style="background: #e0f2fe; border-radius: 12px; padding: 14px; border-left: 5px solid #0284c7;">
+                        <div style="font-size: 12px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
+                        <div style="font-size: 28px; font-weight: 800; color: #0c4a6e;">{len(downloader.visited)}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1045,9 +882,9 @@ if start_btn:
             with mcol2:
                 st.markdown(
                     f"""
-                    <div style="background: #dcfce7; border-radius: 12px; padding: 16px; border-left: 6px solid #16a34a; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
-                        <div style="font-size: 13px; font-weight: 700; color: #15803d;">PDFs HARVESTED</div>
-                        <div style="font-size: 32px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
+                    <div style="background: #dcfce7; border-radius: 12px; padding: 14px; border-left: 5px solid #16a34a;">
+                        <div style="font-size: 12px; font-weight: 700; color: #15803d;">PDFs DOWNLOADED</div>
+                        <div style="font-size: 28px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1055,9 +892,9 @@ if start_btn:
             with mcol3:
                 st.markdown(
                     f"""
-                    <div style="background: #fee2e2; border-radius: 12px; padding: 16px; border-left: 6px solid #dc2626; box-shadow: 0 2px 8px rgba(0,0,0,0.04);">
-                        <div style="font-size: 13px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
-                        <div style="font-size: 32px; font-weight: 800; color: #991b1b;">{failed_count}</div>
+                    <div style="background: #fee2e2; border-radius: 12px; padding: 14px; border-left: 5px solid #dc2626;">
+                        <div style="font-size: 12px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
+                        <div style="font-size: 28px; font-weight: 800; color: #991b1b;">{failed_count}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -1092,28 +929,9 @@ if start_btn:
                 ]
                 st.dataframe(manifest_view, use_container_width=True)
             else:
-                st.info("No PDF documents were located at the provided target.")
+                st.info("No PDF documents were found at the provided URL.")
 
-# 5. Recommendation / Tip Banner (matching the warm yellow banner)
-st.markdown(
-    """
-    <div class="rec-banner">
-        <div class="rec-left">
-            <span class="rec-star">★</span>
-            <div>
-                <p class="rec-title">Pro Tip for Educational Archives</p>
-                <p class="rec-sub">For eGyanKosh course blocks, use 'Deep Crawl'. For single notice/circular tables (like NTA Page 11), switch to 'Current Page Only'.</p>
-            </div>
-        </div>
-        <div style="background: white; border: 1px solid #fcd34d; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; color: #b45309;">
-            💡 Smart Tip
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# 6. Navy & Gold Bottom Banner
+# 5. Footer Banner
 st.markdown(
     """
     <div class="omni-footer">
