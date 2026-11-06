@@ -48,6 +48,7 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 HANDLE_RE = re.compile(r"/handle/(\d+)/([^/?#]+)", re.I)
+DSPACE_HANDLE_STRICT = re.compile(r"^/handle/(\d+)/([a-zA-Z0-9_.\-]+)$", re.I)
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -110,6 +111,17 @@ def normalize_host(netloc: str) -> str:
 
 def same_site(url: str, host: str) -> bool:
     return normalize_host(urlparse(url).netloc) == normalize_host(host)
+
+
+def is_valid_pdf_bitstream(href: str) -> bool:
+    """Rejects DSpace thumbnail image bundles (.jpg, .png) and non-PDF bitstreams."""
+    u = urlparse(href)
+    p = u.path.lower()
+    if any(p.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".txt", ".mp4", ".mp3")):
+        return False
+    if any(ext in href.lower() for ext in (".jpg?", ".jpeg?", ".png?", ".gif?", ".webp?", "thumbnail")):
+        return False
+    return True
 
 
 POSTBACK_RE = re.compile(r"""__doPostBack\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]\s*\)""", re.I)
@@ -302,27 +314,38 @@ class WebDownloader:
                 self.log(f"⚠️ Could not load `{url}`: {exc}")
 
     def process_dspace(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
-        is_item = bool(soup.select_one("table.itemDisplayTable") or
-                       soup.find("meta", attrs={"name": re.compile(r"citation_pdf_url", re.I)}) or
-                       "files in this item" in soup.get_text(" ", strip=True).lower())
+        # 1. On starting page, blacklist parent breadcrumbs to prevent crawling upwards into parent university faculties
+        if depth == 0:
+            for b in soup.find_all(["ol", "ul", "div", "nav"], class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "breadcrumbs"))):
+                for a in b.find_all("a", href=True):
+                    self.visited.add(canonical(urljoin(page_url, a["href"])))
 
-        if is_item:
+        # 2. Extract direct bitstream PDF links if present on this page (works across both DSpace JSPUI & XMLUI)
+        pdf_links = self.extract_dspace_pdf_links(soup, page_url)
+        if pdf_links:
             meta = self.extract_dspace_metadata(soup)
-            pdf_links = self.extract_dspace_pdf_links(soup, page_url)
             for pdf_url, label in pdf_links:
                 raw_name = label or PurePosixPath(urlparse(pdf_url).path).name
                 filename = safe_filename(raw_name)
                 self.download_pdf(pdf_url, filename, page_url, meta=meta)
             return
 
-        main = soup.find("main") or soup.find(id="content") or soup.body or soup
-        for a in main.find_all("a", href=True):
-            if a.find_parent(class_="breadcrumb") or a.find_parent("header") or a.find_parent("footer"):
-                continue
-            child_url = canonical(urljoin(page_url, a["href"]))
-            if same_site(child_url, self.host) and HANDLE_RE.search(urlparse(child_url).path):
-                if child_url not in self.visited:
-                    queue.append((child_url, depth + 1))
+        # 3. Community / Collection index: queue child sub-communities, collections, and items
+        if depth < self.max_depth:
+            main = soup.find("main") or soup.find(id="content") or soup.find("div", class_="container") or soup.body or soup
+            for a in main.find_all("a", href=True):
+                # Skip breadcrumbs, headers, footers, search facets, and sidebars
+                if a.find_parent(class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "header", "footer", "sidebar", "facet", "browse"))):
+                    continue
+                raw_href = a["href"].strip()
+                if any(w in raw_href.lower() for w in ("simple-search", "browse?", "login", "register", "password", "signon", "?mode=full")):
+                    continue
+
+                child_url = canonical(urljoin(page_url, raw_href))
+                u = urlparse(child_url)
+                if same_site(child_url, self.host) and DSPACE_HANDLE_STRICT.match(u.path.rstrip("/")):
+                    if child_url not in self.visited and not any(child_url == q_url for q_url, _ in queue):
+                        queue.append((child_url, depth + 1))
 
     def extract_generic_page_metadata(self, soup: BeautifulSoup, page_url: str) -> dict:
         meta = {}
@@ -441,24 +464,32 @@ class WebDownloader:
         for table in soup.find_all("table"):
             for row in table.find_all("tr"):
                 cells = row.find_all(["td", "th"])
-                row_links = [urljoin(page_url, a["href"]) for a in row.find_all("a", href=True) if "/bitstream/" in a["href"].lower()]
+                # Exclude image thumbnails and non-PDF bitstreams
+                row_links = [
+                    urljoin(page_url, a["href"]) 
+                    for a in row.find_all("a", href=True) 
+                    if "/bitstream/" in a["href"].lower() and is_valid_pdf_bitstream(a["href"])
+                ]
                 if not row_links:
                     continue
 
                 filename = ""
                 for a in row.find_all("a", href=True):
                     txt = clean_text(a.get_text(" ", strip=True))
-                    if txt and txt.lower() not in generic_labels:
+                    if txt and txt.lower() not in generic_labels and is_valid_pdf_bitstream(a["href"]):
                         filename = txt
                         break
                 if not filename and cells:
-                    first_cell = clean_text(cells[0].get_text(" ", strip=True))
-                    if first_cell and first_cell.lower() not in generic_labels:
-                        filename = first_cell
+                    for c in cells:
+                        c_text = clean_text(c.get_text(" ", strip=True))
+                        if c_text and c_text.lower() not in generic_labels and not any(w in c_text.lower() for w in ("adobe", "mb", "kb", "format", "size", "thumbnail")):
+                            filename = c_text
+                            break
 
+                # Prioritize direct .pdf links over non-extension URLs
                 best_link = row_links[0]
                 for l in row_links:
-                    if "isallowed=y" in l.lower():
+                    if l.lower().endswith(".pdf") or ".pdf?" in l.lower():
                         best_link = l
                         break
 
@@ -469,20 +500,19 @@ class WebDownloader:
 
                 if not filename:
                     filename = PurePosixPath(u.path).name
-                if "isallowed=" not in best_link.lower():
-                    best_link += ("&" if "?" in best_link else "?") + "isAllowed=y"
 
                 found.append((best_link, filename))
 
         for a in soup.find_all("a", href=True):
-            href = urljoin(page_url, a["href"])
+            raw_href = a["href"].strip()
+            if not is_valid_pdf_bitstream(raw_href):
+                continue
+            href = urljoin(page_url, raw_href)
             u = urlparse(href)
             if "/bitstream/" in u.path.lower() and u.path.lower() not in seen_paths:
                 label = clean_text(a.get_text(" ", strip=True))
                 name = PurePosixPath(u.path).name
                 final_name = name if label.lower() in generic_labels else (label or name)
-                if "isallowed=" not in href.lower():
-                    href += ("&" if "?" in href else "?") + "isAllowed=y"
                 seen_paths.add(u.path.lower())
                 found.append((href, final_name))
 
@@ -493,7 +523,7 @@ class WebDownloader:
         for tag in soup.find_all("meta"):
             key = (tag.get("name") or "").strip()
             value = clean_text(tag.get("content", ""))
-            if key and value and (key.lower().startswith("dc.") or key.lower().startswith("citation_")):
+            if key and value and (key.lower().startswith("dc.") or key.lower().startswith("dcterms.") or key.lower().startswith("citation_")):
                 data.setdefault(key, []).append(value)
 
         table = soup.select_one("table.itemDisplayTable")
@@ -1064,11 +1094,11 @@ with st.container():
                 horizontal=True,
             )
         with scol2:
-            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=300, value=30)
+            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=500, value=150)
         with scol3:
             request_delay = st.slider("Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-    max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
+    max_depth = 5 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Initialize persistent session state for extraction results
