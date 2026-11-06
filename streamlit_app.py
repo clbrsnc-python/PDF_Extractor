@@ -101,6 +101,10 @@ def clean_url(url: str) -> str:
 
 def canonical(url: str) -> str:
     url, _ = urldefrag(clean_url(url))
+    u = urlsplit(url)
+    # Normalize scheme to https to prevent http/https duplication and redirect mismatches
+    if u.scheme == "http":
+        url = urlunsplit(("https", u.netloc, u.path, u.query, u.fragment))
     return url.rstrip("/")
 
 
@@ -331,13 +335,12 @@ class WebDownloader:
             return
 
         # 3. Community / Collection index: queue child sub-communities, collections, and items
-        effective_max_depth = self.max_depth
-        # Auto-expand depth if starting URL is a Community/Collection index with no direct bitstreams
-        if depth == 0 and not pdf_links and effective_max_depth == 0:
-            effective_max_depth = 5
+        # Auto-expand depth persistently if starting URL is a Community/Collection index with no direct bitstreams
+        if depth == 0 and not pdf_links and self.max_depth == 0:
+            self.max_depth = 5
             self.log("ℹ️ Index page detected without direct PDFs. Auto-expanding depth to traverse child collections.")
 
-        if depth < effective_max_depth:
+        if depth < self.max_depth:
             # Search entire body; do not restrict to first container (which is only the header navbar in JSPUI)
             search_scope = soup.body or soup
             for a in search_scope.find_all("a", href=True):
