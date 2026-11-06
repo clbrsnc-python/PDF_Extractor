@@ -48,7 +48,7 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 HANDLE_RE = re.compile(r"/handle/(\d+)/([^/?#]+)", re.I)
-DSPACE_HANDLE_STRICT = re.compile(r"^/handle/(\d+)/([a-zA-Z0-9_.\-]+)$", re.I)
+DSPACE_HANDLE_STRICT = re.compile(r"^/+handle/(\d+)/([a-zA-Z0-9_.\-]+)$", re.I)
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -331,19 +331,29 @@ class WebDownloader:
             return
 
         # 3. Community / Collection index: queue child sub-communities, collections, and items
-        if depth < self.max_depth:
-            main = soup.find("main") or soup.find(id="content") or soup.find("div", class_="container") or soup.body or soup
-            for a in main.find_all("a", href=True):
-                # Skip breadcrumbs, headers, footers, search facets, and sidebars
-                if a.find_parent(class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "header", "footer", "sidebar", "facet", "browse"))):
+        effective_max_depth = self.max_depth
+        # Auto-expand depth if starting URL is a Community/Collection index with no direct bitstreams
+        if depth == 0 and not pdf_links and effective_max_depth == 0:
+            effective_max_depth = 5
+            self.log("ℹ️ Index page detected without direct PDFs. Auto-expanding depth to traverse child collections.")
+
+        if depth < effective_max_depth:
+            # Search entire body; do not restrict to first container (which is only the header navbar in JSPUI)
+            search_scope = soup.body or soup
+            for a in search_scope.find_all("a", href=True):
+                # Skip breadcrumbs, headers, footers, search facets, and top navbars
+                if a.find_parent(["header", "footer", "nav"]) or a.find_parent(
+                    class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "navbar", "header", "footer", "facet"))
+                ):
                     continue
                 raw_href = a["href"].strip()
-                if any(w in raw_href.lower() for w in ("simple-search", "browse?", "login", "register", "password", "signon", "?mode=full")):
+                if any(w in raw_href.lower() for w in ("simple-search", "browse?", "/browse", "login", "register", "password", "signon", "?mode=full")):
                     continue
 
                 child_url = canonical(urljoin(page_url, raw_href))
                 u = urlparse(child_url)
-                if same_site(child_url, self.host) and DSPACE_HANDLE_STRICT.match(u.path.rstrip("/")):
+                norm_path = "/" + u.path.lstrip("/")
+                if same_site(child_url, self.host) and DSPACE_HANDLE_STRICT.match(norm_path.rstrip("/")):
                     if child_url not in self.visited and not any(child_url == q_url for q_url, _ in queue):
                         queue.append((child_url, depth + 1))
 
