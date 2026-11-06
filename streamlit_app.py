@@ -48,7 +48,6 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 HANDLE_RE = re.compile(r"/handle/(\d+)/([^/?#]+)", re.I)
-DSPACE_HANDLE_STRICT = re.compile(r"^/handle/(\d+)/([a-zA-Z0-9_.\-]+)$", re.I)
 BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -303,38 +302,27 @@ class WebDownloader:
                 self.log(f"⚠️ Could not load `{url}`: {exc}")
 
     def process_dspace(self, soup: BeautifulSoup, page_url: str, queue: deque, depth: int):
-        # 1. On starting page, blacklist parent breadcrumbs to prevent crawling upwards into parent university faculties
-        if depth == 0:
-            for b in soup.find_all(["ol", "ul", "div", "nav"], class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "breadcrumbs"))):
-                for a in b.find_all("a", href=True):
-                    self.visited.add(canonical(urljoin(page_url, a["href"])))
+        is_item = bool(soup.select_one("table.itemDisplayTable") or
+                       soup.find("meta", attrs={"name": re.compile(r"citation_pdf_url", re.I)}) or
+                       "files in this item" in soup.get_text(" ", strip=True).lower())
 
-        # 2. Extract direct bitstream PDF links if present on this page (works across both DSpace JSPUI & XMLUI)
-        pdf_links = self.extract_dspace_pdf_links(soup, page_url)
-        if pdf_links:
+        if is_item:
             meta = self.extract_dspace_metadata(soup)
+            pdf_links = self.extract_dspace_pdf_links(soup, page_url)
             for pdf_url, label in pdf_links:
                 raw_name = label or PurePosixPath(urlparse(pdf_url).path).name
                 filename = safe_filename(raw_name)
                 self.download_pdf(pdf_url, filename, page_url, meta=meta)
             return
 
-        # 3. Community / Collection index: queue child sub-communities, collections, and items
-        if depth < self.max_depth:
-            main = soup.find("main") or soup.find(id="content") or soup.find("div", class_="container") or soup.body or soup
-            for a in main.find_all("a", href=True):
-                # Skip breadcrumbs, headers, footers, search facets, and sidebars
-                if a.find_parent(class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "header", "footer", "sidebar", "facet", "browse"))):
-                    continue
-                raw_href = a["href"].strip()
-                if any(w in raw_href.lower() for w in ("simple-search", "browse?", "login", "register", "password", "signon", "?mode=full")):
-                    continue
-
-                child_url = canonical(urljoin(page_url, raw_href))
-                u = urlparse(child_url)
-                if same_site(child_url, self.host) and DSPACE_HANDLE_STRICT.match(u.path.rstrip("/")):
-                    if child_url not in self.visited and not any(child_url == q_url for q_url, _ in queue):
-                        queue.append((child_url, depth + 1))
+        main = soup.find("main") or soup.find(id="content") or soup.body or soup
+        for a in main.find_all("a", href=True):
+            if a.find_parent(class_="breadcrumb") or a.find_parent("header") or a.find_parent("footer"):
+                continue
+            child_url = canonical(urljoin(page_url, a["href"]))
+            if same_site(child_url, self.host) and HANDLE_RE.search(urlparse(child_url).path):
+                if child_url not in self.visited:
+                    queue.append((child_url, depth + 1))
 
     def extract_generic_page_metadata(self, soup: BeautifulSoup, page_url: str) -> dict:
         meta = {}
@@ -1076,11 +1064,11 @@ with st.container():
                 horizontal=True,
             )
         with scol2:
-            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=500, value=150)
+            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=300, value=30)
         with scol3:
             request_delay = st.slider("Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-    max_depth = 5 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
+    max_depth = 2 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Initialize persistent session state for extraction results
