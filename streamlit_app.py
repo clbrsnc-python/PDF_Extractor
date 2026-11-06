@@ -25,7 +25,15 @@ from urllib.parse import urljoin, urlparse, urldefrag, unquote, urlsplit, urluns
 import urllib3
 import requests
 from bs4 import BeautifulSoup
-import streamlit as st
+try:
+    import streamlit as st
+    from streamlit.runtime import exists as st_runtime_exists
+    HAS_STREAMLIT = True
+    RUNNING_IN_STREAMLIT = st_runtime_exists()
+except Exception:
+    st = None
+    HAS_STREAMLIT = False
+    RUNNING_IN_STREAMLIT = False
 try:
     import pandas as pd
     HAS_PANDAS = True
@@ -41,6 +49,23 @@ except Exception:
 
 # Suppress insecure SSL warnings for educational/institutional portals
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import ssl
+from urllib3.util.ssl_ import create_urllib3_context
+
+class LegacySSLAdapter(requests.adapters.HTTPAdapter):
+    """Permits legacy TLS 1.0/1.1 and weaker ciphers used on older Indian university portals."""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+        except Exception:
+            pass
+        kwargs["ssl_context"] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -99,14 +124,19 @@ def clean_url(url: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
 
 
+def visited_key(url: str) -> str:
+    """Normalizes URL for duplicate detection across http/https and trailing slashes."""
+    u = urlsplit(url)
+    netloc = normalize_host(u.netloc)
+    path = u.path.rstrip("/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    return f"{netloc}{path}"
+
+
 def canonical(url: str) -> str:
     url, _ = urldefrag(clean_url(url))
-    u = urlsplit(url)
-    # Normalize scheme to https to prevent http/https duplication and redirect mismatches
-    if u.scheme == "http":
-        url = urlunsplit(("https", u.netloc, u.path, u.query, u.fragment))
     return url.rstrip("/")
-
 
 def normalize_host(netloc: str) -> str:
     h = netloc.lower().split(":")[0]
@@ -212,6 +242,9 @@ class WebDownloader:
         self.status_container = status_container
 
         self.session = requests.Session()
+        adapter = LegacySSLAdapter()
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update({
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,application/pdf,*/*;q=0.8",
@@ -236,21 +269,30 @@ class WebDownloader:
         if headers:
             req_headers.update(headers)
 
-        for attempt in range(3):
-            try:
-                response = self.session.get(
-                    url,
-                    headers=req_headers,
-                    timeout=self.timeout,
-                    stream=stream,
-                    allow_redirects=True,
-                    verify=False,
-                )
-                response.raise_for_status()
-                return response
-            except Exception as exc:
-                last_error = exc
-                time.sleep(1.0 * (attempt + 1))
+        # Build fallback list: if https fails, fall back to http automatically (crucial for Indian edu/govt repos)
+        targets = [url]
+        if url.startswith("https://"):
+            targets.append("http://" + url[8:])
+        elif url.startswith("http://"):
+            targets.append("https://" + url[7:])
+
+        for target in targets:
+            for attempt in range(2):
+                try:
+                    response = self.session.get(
+                        target,
+                        headers=req_headers,
+                        timeout=self.timeout,
+                        stream=stream,
+                        allow_redirects=True,
+                        verify=False,
+                    )
+                    response.raise_for_status()
+                    return response
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(0.5)
+
         raise last_error
 
     def detect_mode(self, first_soup: BeautifulSoup, first_url: str):
@@ -273,9 +315,9 @@ class WebDownloader:
         while queue and len(self.visited) < self.max_pages:
             url, depth = queue.popleft()
             url = canonical(url)
-            if url in self.visited:
+            if visited_key(url) in self.visited:
                 continue
-            self.visited.add(url)
+            self.visited.add(visited_key(url))
 
             if progress_bar:
                 progress_bar.progress(min(1.0, len(self.visited) / max(1, self.max_pages)))
@@ -322,7 +364,7 @@ class WebDownloader:
         if depth == 0:
             for b in soup.find_all(["ol", "ul", "div", "nav"], class_=lambda c: c and any(w in str(c).lower() for w in ("breadcrumb", "trail", "breadcrumbs"))):
                 for a in b.find_all("a", href=True):
-                    self.visited.add(canonical(urljoin(page_url, a["href"])))
+                    self.visited.add(visited_key(urljoin(page_url, a["href"])))
 
         # 2. Extract direct bitstream PDF links if present on this page (works across both DSpace JSPUI & XMLUI)
         pdf_links = self.extract_dspace_pdf_links(soup, page_url)
@@ -357,7 +399,7 @@ class WebDownloader:
                 u = urlparse(child_url)
                 norm_path = "/" + u.path.lstrip("/")
                 if same_site(child_url, self.host) and DSPACE_HANDLE_STRICT.match(norm_path.rstrip("/")):
-                    if child_url not in self.visited and not any(child_url == q_url for q_url, _ in queue):
+                    if visited_key(child_url) not in self.visited and not any(child_url == q_url for q_url, _ in queue):
                         queue.append((child_url, depth + 1))
 
     def extract_generic_page_metadata(self, soup: BeautifulSoup, page_url: str) -> dict:
@@ -841,578 +883,650 @@ def build_zip_on_disk(downloaded_files, records, output_zip_path: Path, folder_n
 # -------------------------------------------------------------
 # Streamlit UI Configuration
 # -------------------------------------------------------------
-st.set_page_config(
-    page_title="PDF Extractor",
-    page_icon="🎓",
-    layout="wide",
-)
+def render_streamlit_ui():
 
-st.markdown(
-    """
-    <head>
-        <title>PDF Extractor</title>
-        <meta property="og:title" content="PDF Extractor" />
-        <meta property="og:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
-        <meta property="og:site_name" content="PDF Extractor" />
-        <meta property="og:type" content="website" />
-        <meta name="twitter:title" content="PDF Extractor" />
-        <meta name="twitter:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
-    </head>
-    """,
-    unsafe_allow_html=True,
-)
+    st.set_page_config(
+        page_title="PDF Extractor",
+        page_icon="🎓",
+        layout="wide",
+    )
 
-# Custom Styling
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cinzel:wght@700;800&display=swap');
+    st.markdown(
+        """
+        <head>
+            <title>PDF Extractor</title>
+            <meta property="og:title" content="PDF Extractor" />
+            <meta property="og:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
+            <meta property="og:site_name" content="PDF Extractor" />
+            <meta property="og:type" content="website" />
+            <meta name="twitter:title" content="PDF Extractor" />
+            <meta name="twitter:description" content="Universal Bulk Document Harvesting & PDF Extractor" />
+        </head>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    .stApp {
-        background: #f4f7fb;
-        font-family: 'Plus Jakarta Sans', sans-serif;
-    }
+    # Custom Styling
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Cinzel:wght@700;800&display=swap');
 
-    /* Main Header Card with Golden & White Typography */
-    .system-header-card {
-        background: linear-gradient(135deg, #021a44 0%, #082d6c 60%, #031e50 100%);
-        border-bottom: 3px solid #d4af37;
-        border-radius: 14px;
-        padding: 18px 24px;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 18px;
-        box-shadow: 0 6px 20px rgba(2, 26, 68, 0.12);
-    }
-    .system-header-left {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-    }
-    .system-header-icon {
-        background: #1e40af;
-        border: 2px solid #d4af37;
-        color: #ffd700;
-        width: 46px;
-        height: 46px;
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 24px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-    }
+        .stApp {
+            background: #f4f7fb;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+        }
 
-    /* Force dark, readable font on ALL widgets on mobile */
-    .stRadio label, .stRadio div, .stRadio p, .stRadio span {
-        color: #0f172a !important;
-        font-weight: 600 !important;
-    }
-    .stSlider label, .stSlider div, .stSlider p, .stSlider span {
-        color: #0f172a !important;
-        font-weight: 600 !important;
-    }
-    .stNumberInput label, .stNumberInput div, .stNumberInput p, .stNumberInput span, .stNumberInput input {
-        color: #0f172a !important;
-        font-weight: 600 !important;
-    }
-    .streamlit-expanderHeader, [data-testid="stExpander"] summary, [data-testid="stExpander"] details summary p {
-        color: #0f172a !important;
-        font-weight: 700 !important;
-    }
-    [data-testid="stExpander"] {
-        background-color: #f8faff !important;
-        border: 1px solid #bfdbfe !important;
-        border-radius: 10px !important;
-    }
-    [data-testid="stExpander"] * {
-        color: #0f172a !important;
-    }
+        /* Main Header Card with Golden & White Typography */
+        .system-header-card {
+            background: linear-gradient(135deg, #021a44 0%, #082d6c 60%, #031e50 100%);
+            border-bottom: 3px solid #d4af37;
+            border-radius: 14px;
+            padding: 18px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 18px;
+            box-shadow: 0 6px 20px rgba(2, 26, 68, 0.12);
+        }
+        .system-header-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+        .system-header-icon {
+            background: #1e40af;
+            border: 2px solid #d4af37;
+            color: #ffd700;
+            width: 46px;
+            height: 46px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
 
-    /* Title: PDF Extractor in Brilliant Golden */
-    .system-title,
-    h1.system-title,
-    div.system-title,
-    .stApp .system-title {
-        font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important;
-        font-size: 30px !important;
-        font-weight: 800 !important;
-        color: #ffd700 !important;
-        -webkit-text-fill-color: #ffd700 !important;
-        margin: 0 !important;
-        letter-spacing: 1px !important;
-        text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5) !important;
-    }
-    .system-subtitle {
-        font-size: 13px;
-        font-weight: 500;
-        color: #ffffff !important;
-        margin: 0;
-        letter-spacing: 0.4px;
-    }
-    .system-badge-right {
-        background: rgba(255, 255, 255, 0.12);
-        border: 1px solid rgba(212, 175, 55, 0.5);
-        color: #ffd700;
-        font-weight: 700;
-        font-size: 13px;
-        padding: 6px 14px;
-        border-radius: 20px;
-    }
+        /* Force dark, readable font on ALL widgets on mobile */
+        .stRadio label, .stRadio div, .stRadio p, .stRadio span {
+            color: #0f172a !important;
+            font-weight: 600 !important;
+        }
+        .stSlider label, .stSlider div, .stSlider p, .stSlider span {
+            color: #0f172a !important;
+            font-weight: 600 !important;
+        }
+        .stNumberInput label, .stNumberInput div, .stNumberInput p, .stNumberInput span, .stNumberInput input {
+            color: #0f172a !important;
+            font-weight: 600 !important;
+        }
+        .streamlit-expanderHeader, [data-testid="stExpander"] summary, [data-testid="stExpander"] details summary p {
+            color: #0f172a !important;
+            font-weight: 700 !important;
+        }
+        [data-testid="stExpander"] {
+            background-color: #f8faff !important;
+            border: 1px solid #bfdbfe !important;
+            border-radius: 10px !important;
+        }
+        [data-testid="stExpander"] * {
+            color: #0f172a !important;
+        }
 
-    /* PROMINENTLY HIGHLIGHTED URL INPUT CONTAINER */
-    .highlighted-input-box {
-        background: #ffffff;
-        border: 2px solid #2563eb;
-        border-radius: 14px;
-        padding: 18px 20px 14px 20px;
-        margin-bottom: 16px;
-        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.08);
-    }
-    .input-label-highlight {
-        font-size: 16px;
-        font-weight: 800;
-        color: #0f172a;
-        margin-bottom: 10px;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
+        /* Title: PDF Extractor in Brilliant Golden */
+        .system-title,
+        h1.system-title,
+        div.system-title,
+        .stApp .system-title {
+            font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important;
+            font-size: 30px !important;
+            font-weight: 800 !important;
+            color: #ffd700 !important;
+            -webkit-text-fill-color: #ffd700 !important;
+            margin: 0 !important;
+            letter-spacing: 1px !important;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.5) !important;
+        }
+        .system-subtitle {
+            font-size: 13px;
+            font-weight: 500;
+            color: #ffffff !important;
+            margin: 0;
+            letter-spacing: 0.4px;
+        }
+        .system-badge-right {
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(212, 175, 55, 0.5);
+            color: #ffd700;
+            font-weight: 700;
+            font-size: 13px;
+            padding: 6px 14px;
+            border-radius: 20px;
+        }
 
-    /* Highlighting text input with soft tint and blinking cursor */
-    .stTextInput > div > div > input {
-        background-color: #f8faff !important;
-        border: 1.5px solid #3b82f6 !important;
-        border-radius: 8px !important;
-        font-size: 15px !important;
-        color: #0f172a !important;
-        caret-color: #1d4ed8 !important;
-        padding: 10px 14px !important;
-        box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
-    }
-    .stTextInput > div > div > input:focus {
-        border-color: #1d4ed8 !important;
-        background-color: #ffffff !important;
-        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15) !important;
-    }
+        /* PROMINENTLY HIGHLIGHTED URL INPUT CONTAINER */
+        .highlighted-input-box {
+            background: #ffffff;
+            border: 2px solid #2563eb;
+            border-radius: 14px;
+            padding: 18px 20px 14px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 6px 20px rgba(37, 99, 235, 0.08);
+        }
+        .input-label-highlight {
+            font-size: 16px;
+            font-weight: 800;
+            color: #0f172a;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
 
-    /* COMPACT COLORFUL STATUS TILES (Reduced Size, No Arrows) */
-    .compact-tile {
-        border-radius: 8px;
-        padding: 8px 10px;
-        text-align: center;
-        height: 100%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 8px;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-        margin-top: 14px;
-        margin-bottom: 14px;
-    }
-    .tile-icon {
-        font-size: 16px;
-        line-height: 1;
-    }
-    .tile-text-wrap {
-        text-align: left;
-    }
-    .tile-title {
-        font-size: 11px;
-        font-weight: 800;
-        line-height: 1.2;
-    }
-    .tile-desc {
-        font-size: 9px;
-        font-weight: 600;
-        line-height: 1.1;
-    }
+        /* Highlighting text input with soft tint and blinking cursor */
+        .stTextInput > div > div > input {
+            background-color: #f8faff !important;
+            border: 1.5px solid #3b82f6 !important;
+            border-radius: 8px !important;
+            font-size: 15px !important;
+            color: #0f172a !important;
+            caret-color: #1d4ed8 !important;
+            padding: 10px 14px !important;
+            box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.04);
+        }
+        .stTextInput > div > div > input:focus {
+            border-color: #1d4ed8 !important;
+            background-color: #ffffff !important;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15) !important;
+        }
 
-    /* Color variations */
-    .tile-blue { background: #e0f2fe; border: 1px solid #bae6fd; color: #0369a1; }
-    .tile-blue .tile-desc { color: #0284c7; }
+        /* COMPACT COLORFUL STATUS TILES (Reduced Size, No Arrows) */
+        .compact-tile {
+            border-radius: 8px;
+            padding: 8px 10px;
+            text-align: center;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+            margin-top: 14px;
+            margin-bottom: 14px;
+        }
+        .tile-icon {
+            font-size: 16px;
+            line-height: 1;
+        }
+        .tile-text-wrap {
+            text-align: left;
+        }
+        .tile-title {
+            font-size: 11px;
+            font-weight: 800;
+            line-height: 1.2;
+        }
+        .tile-desc {
+            font-size: 9px;
+            font-weight: 600;
+            line-height: 1.1;
+        }
 
-    .tile-green { background: #dcfce7; border: 1px solid #bbf7d0; color: #15803d; }
-    .tile-green .tile-desc { color: #16a34a; }
+        /* Color variations */
+        .tile-blue { background: #e0f2fe; border: 1px solid #bae6fd; color: #0369a1; }
+        .tile-blue .tile-desc { color: #0284c7; }
 
-    .tile-orange { background: #ffedd5; border: 1px solid #fed7aa; color: #c2410c; }
-    .tile-orange .tile-desc { color: #ea580c; }
+        .tile-green { background: #dcfce7; border: 1px solid #bbf7d0; color: #15803d; }
+        .tile-green .tile-desc { color: #16a34a; }
 
-    .tile-purple { background: #f3e8ff; border: 1px solid #e9d5ff; color: #7e22ce; }
-    .tile-purple .tile-desc { color: #9333ea; }
+        .tile-orange { background: #ffedd5; border: 1px solid #fed7aa; color: #c2410c; }
+        .tile-orange .tile-desc { color: #ea580c; }
 
-    .tile-teal { background: #ccfbf1; border: 1px solid #99f6e4; color: #0f766e; }
-    .tile-teal .tile-desc { color: #0d9488; }
+        .tile-purple { background: #f3e8ff; border: 1px solid #e9d5ff; color: #7e22ce; }
+        .tile-purple .tile-desc { color: #9333ea; }
 
-    /* Footer */
-    .omni-footer {
-        background: #02163b;
-        color: #ffd54f;
-        text-align: center;
-        padding: 8px;
-        border-radius: 6px;
-        font-style: italic;
-        font-size: 13px;
-        letter-spacing: 0.8px;
-        margin-top: 20px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+        .tile-teal { background: #ccfbf1; border: 1px solid #99f6e4; color: #0f766e; }
+        .tile-teal .tile-desc { color: #0d9488; }
 
-# 1. Header: PDF Extractor (Golden & White)
-st.markdown(
-    """
-    <div class="system-header-card">
-        <div class="system-header-left">
-            <div class="system-header-icon">🎓</div>
-            <div>
-                <div class="system-title" style="color: #ffd700 !important; -webkit-text-fill-color: #ffd700 !important; font-size: 30px !important; font-weight: 800 !important; font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important; letter-spacing: 1px !important; text-shadow: 0 2px 10px rgba(0,0,0,0.5) !important;">PDF Extractor</div>
-                <div class="system-subtitle" style="color: #ffffff !important; font-size: 13px !important; font-weight: 500 !important; margin-top: 4px !important;">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</div>
+        /* Footer */
+        .omni-footer {
+            background: #02163b;
+            color: #ffd54f;
+            text-align: center;
+            padding: 8px;
+            border-radius: 6px;
+            font-style: italic;
+            font-size: 13px;
+            letter-spacing: 0.8px;
+            margin-top: 20px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 1. Header: PDF Extractor (Golden & White)
+    st.markdown(
+        """
+        <div class="system-header-card">
+            <div class="system-header-left">
+                <div class="system-header-icon">🎓</div>
+                <div>
+                    <div class="system-title" style="color: #ffd700 !important; -webkit-text-fill-color: #ffd700 !important; font-size: 30px !important; font-weight: 800 !important; font-family: 'Cinzel', 'Plus Jakarta Sans', serif, sans-serif !important; letter-spacing: 1px !important; text-shadow: 0 2px 10px rgba(0,0,0,0.5) !important;">PDF Extractor</div>
+                    <div class="system-subtitle" style="color: #ffffff !important; font-size: 13px !important; font-weight: 500 !important; margin-top: 4px !important;">Universal Document Harvesting • Live Streaming • Rich Metadata Parser</div>
+                </div>
+            </div>
+            <div class="system-badge-right">
+                ⚡ Ready
             </div>
         </div>
-        <div class="system-badge-right">
-            ⚡ Ready
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+        """,
+        unsafe_allow_html=True,
+    )
 
-# 2. PROMINENTLY HIGHLIGHTED SEARCH & SETTINGS BOX
-with st.container():
-    st.markdown('<div class="highlighted-input-box">', unsafe_allow_html=True)
-    st.markdown('<div class="input-label-highlight"><span>🔗 Paste Repository, Archive, or Webpage URL:</span></div>', unsafe_allow_html=True)
+    # 2. PROMINENTLY HIGHLIGHTED SEARCH & SETTINGS BOX
+    with st.container():
+        st.markdown('<div class="highlighted-input-box">', unsafe_allow_html=True)
+        st.markdown('<div class="input-label-highlight"><span>🔗 Paste Repository, Archive, or Webpage URL:</span></div>', unsafe_allow_html=True)
 
-    url_col, btn_col = st.columns([4, 1])
-    with url_col:
-        target_url = st.text_input(
-            "Target URL",
-            placeholder="",
-            label_visibility="collapsed",
-        )
-    with btn_col:
-        start_btn = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
-
-    # Inline Settings directly inside the white highlighted box
-    with st.expander("⚙️ Crawler Settings", expanded=False):
-        scol1, scol2, scol3 = st.columns([2, 1, 1])
-        with scol1:
-            crawl_mode = st.radio(
-                "Crawl Mode",
-                options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
-                index=0,  # Deep Crawl is default
-                horizontal=True,
+        url_col, btn_col = st.columns([4, 1])
+        with url_col:
+            target_url = st.text_input(
+                "Target URL",
+                placeholder="",
+                label_visibility="collapsed",
             )
-        with scol2:
-            max_pages = st.number_input("Maximum Pages", min_value=1, max_value=500, value=150)
-        with scol3:
-            request_delay = st.slider("Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+        with btn_col:
+            start_btn = st.button("🚀 Start Extraction", type="primary", use_container_width=True)
 
-    max_depth = 5 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
-    st.markdown('</div>', unsafe_allow_html=True)
+        # Inline Settings directly inside the white highlighted box
+        with st.expander("⚙️ Crawler Settings", expanded=False):
+            scol1, scol2, scol3 = st.columns([2, 1, 1])
+            with scol1:
+                crawl_mode = st.radio(
+                    "Crawl Mode",
+                    options=["Deep Crawl (Follow sublinks)", "Current Page Only"],
+                    index=0,  # Deep Crawl is default
+                    horizontal=True,
+                )
+            with scol2:
+                max_pages = st.number_input("Maximum Pages", min_value=1, max_value=500, value=150)
+            with scol3:
+                request_delay = st.slider("Delay (seconds)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
 
-# Initialize persistent session state for extraction results
-if "raw_harvest" not in st.session_state:
-    st.session_state["raw_harvest"] = None
-if "session_temp_dir" not in st.session_state:
-    st.session_state["session_temp_dir"] = None
-if "selected_filenames" not in st.session_state:
-    st.session_state["selected_filenames"] = {}
-if "bundle_folder_name" not in st.session_state:
-    st.session_state["bundle_folder_name"] = "harvested_pdfs"
-if "editor_version" not in st.session_state:
-    st.session_state["editor_version"] = 0
+        max_depth = 5 if crawl_mode == "Deep Crawl (Follow sublinks)" else 0
+        st.markdown('</div>', unsafe_allow_html=True)
 
-# 3. EXTRACTION ENGINE TRIGGER
-if start_btn:
-    if not target_url.strip():
-        st.warning("Please enter a valid URL.")
-    else:
-        url = target_url.strip().strip("'\"")
-        if not urlparse(url).scheme:
-            url = "https://" + url
-
-        # Clean up old session temp directory if any
-        if st.session_state.get("session_temp_dir"):
-            shutil.rmtree(st.session_state["session_temp_dir"], ignore_errors=True)
-        temp_dir = Path(tempfile.mkdtemp(prefix="pdf_harvest_"))
-        st.session_state["session_temp_dir"] = str(temp_dir)
-
-        status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
-        downloader = WebDownloader(
-            start_url=url,
-            delay=request_delay,
-            max_pages=max_pages,
-            max_depth=max_depth,
-            status_container=status_box,
-        )
-        downloader.temp_dir = temp_dir
-
-        progress_bar = st.progress(0.0)
-        downloader.crawl(progress_bar=progress_bar)
-        progress_bar.progress(1.0)
-        status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
-
-        downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
-        failed_count = sum(1 for r in downloader.records if r.status == "Failed")
-
-        # Suggest default folder name based on URL path or fallback
-        path_name = PurePosixPath(urlparse(url).path).stem
-        default_folder = safe_folder_name(path_name) if path_name and len(path_name) > 3 else "harvested_pdfs"
-        st.session_state["bundle_folder_name"] = default_folder
-
-        # Initialize all downloaded files to Keep = True
-        st.session_state["selected_filenames"] = {
-            f: True for f, _, _ in downloader.downloaded_files
-        }
+    # Initialize persistent session state for extraction results
+    if "raw_harvest" not in st.session_state:
+        st.session_state["raw_harvest"] = None
+    if "session_temp_dir" not in st.session_state:
+        st.session_state["session_temp_dir"] = None
+    if "selected_filenames" not in st.session_state:
+        st.session_state["selected_filenames"] = {}
+    if "bundle_folder_name" not in st.session_state:
+        st.session_state["bundle_folder_name"] = "harvested_pdfs"
+    if "editor_version" not in st.session_state:
         st.session_state["editor_version"] = 0
 
-        # Save harvest records in session_state
-        st.session_state["raw_harvest"] = {
-            "visited_count": len(downloader.visited),
-            "downloaded_count": downloaded_count,
-            "failed_count": failed_count,
-            "downloaded_files": downloader.downloaded_files,
-            "records": downloader.records,
-        }
-
-# 4. PERSISTENT RESULTS & SELECTION CONTROLS (Survives button clicks and app reruns)
-if st.session_state.get("raw_harvest"):
-    temp_dir_str = st.session_state.get("session_temp_dir")
-    # If container rebooted and wiped /tmp, reset stale session gracefully without crashing
-    if not temp_dir_str or not Path(temp_dir_str).exists():
-        st.session_state["raw_harvest"] = None
-        st.session_state["session_temp_dir"] = None
-        st.session_state["cached_zip_key"] = None
-        st.rerun()
-    harvest = st.session_state["raw_harvest"]
-    downloaded_count = harvest["downloaded_count"]
-    failed_count = harvest["failed_count"]
-    visited_count = harvest["visited_count"]
-    downloaded_files = harvest["downloaded_files"]
-    records = harvest["records"]
-
-    # Metric KPI Cards
-    mcol1, mcol2, mcol3 = st.columns(3)
-    with mcol1:
-        st.markdown(
-            f"""
-            <div style="background: #e0f2fe; border-radius: 10px; padding: 12px; border-left: 5px solid #0284c7;">
-                <div style="font-size: 11px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
-                <div style="font-size: 24px; font-weight: 800; color: #0c4a6e;">{visited_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with mcol2:
-        st.markdown(
-            f"""
-            <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
-                <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs HARVESTED</div>
-                <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with mcol3:
-        st.markdown(
-            f"""
-            <div style="background: #fee2e2; border-radius: 10px; padding: 12px; border-left: 5px solid #dc2626;">
-                <div style="font-size: 11px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
-                <div style="font-size: 24px; font-weight: 800; color: #991b1b;">{failed_count}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.write("")
-
-    if downloaded_count > 0:
-        st.markdown("### 📦 Bundle Customization & Document Selection")
-
-        # 1. Ask for folder name after execution
-        f_col1, f_col2 = st.columns([2, 1])
-        with f_col1:
-            custom_folder = st.text_input(
-                "📁 Custom Folder & Archive Name:",
-                value=st.session_state.get("bundle_folder_name", "harvested_pdfs"),
-                help="Name of the exported ZIP and root directory containing your PDFs and metadata.csv",
-                key="input_bundle_name",
-            )
-            st.session_state["bundle_folder_name"] = custom_folder
-        with f_col2:
-            clean_name = safe_folder_name(custom_folder)
-            st.caption("Archive Layout Preview:")
-            st.code(f"{clean_name}.zip\n  ├── {clean_name}/PDFs/...\n  └── {clean_name}/metadata.csv", language="text")
-
-        # 2. Select All / Deselect All controls
-        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
-        with sel_col1:
-            if st.button("✅ Select All", use_container_width=True):
-                for f, _, _ in downloaded_files:
-                    st.session_state["selected_filenames"][f] = True
-                st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
-                st.rerun()
-        with sel_col2:
-            if st.button("❌ Deselect All", use_container_width=True):
-                for f, _, _ in downloaded_files:
-                    st.session_state["selected_filenames"][f] = False
-                st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
-                st.rerun()
-
-        # Prepare DataFrame for interactive keep/ignore selection
-        doc_list = []
-        for rec in records:
-            if rec.status == "Downloaded":
-                is_kept = st.session_state["selected_filenames"].get(rec.filename, True)
-                doc_list.append({
-                    "Keep": is_kept,
-                    "Document Title": rec.title,
-                    "File Name": rec.filename,
-                    "Size (KB)": round(rec.size_bytes / 1024, 1),
-                    "Issue Date": rec.date or "—",
-                    "Publisher / Source": rec.publisher or "—",
-                })
-
-        editor_key = f"manifest_editor_{st.session_state.get('editor_version', 0)}"
-        table_data = pd.DataFrame(doc_list) if HAS_PANDAS else doc_list
-        edited_df = st.data_editor(
-            table_data,
-            column_config={
-                "Keep": st.column_config.CheckboxColumn("Keep", default=True, help="Check to include in ZIP bundle"),
-            },
-            disabled=["Document Title", "File Name", "Size (KB)", "Issue Date", "Publisher / Source"],
-            hide_index=True,
-            use_container_width=True,
-            key=editor_key,
-        )
-
-        # Sync user checkbox edits back to session state safely
-        if HAS_PANDAS and hasattr(edited_df, "to_dict"):
-            table_rows = edited_df.to_dict(orient="records")
-        elif isinstance(edited_df, list):
-            table_rows = edited_df
+    # 3. EXTRACTION ENGINE TRIGGER
+    if start_btn:
+        if not target_url.strip():
+            st.warning("Please enter a valid URL.")
         else:
-            table_rows = doc_list
+            url = target_url.strip().strip("'\"")
+            if not urlparse(url).scheme:
+                url = "https://" + url
 
-        kept_filenames = {r["File Name"] for r in table_rows if r.get("Keep", True)}
-        for f, _, _ in downloaded_files:
-            st.session_state["selected_filenames"][f] = (f in kept_filenames)
+            # Clean up old session temp directory if any
+            if st.session_state.get("session_temp_dir"):
+                shutil.rmtree(st.session_state["session_temp_dir"], ignore_errors=True)
+            temp_dir = Path(tempfile.mkdtemp(prefix="pdf_harvest_"))
+            st.session_state["session_temp_dir"] = str(temp_dir)
 
-        # Filter selected files & records
-        selected_files = [f for f in downloaded_files if f[0] in kept_filenames]
-        selected_records = [r for r in records if r.filename in kept_filenames]
+            status_box = st.status("🔍 Initializing extraction engine...", expanded=True)
+            downloader = WebDownloader(
+                start_url=url,
+                delay=request_delay,
+                max_pages=max_pages,
+                max_depth=max_depth,
+                status_container=status_box,
+            )
+            downloader.temp_dir = temp_dir
 
-        with sel_col3:
-            total_kb = sum(r.size_bytes for r in selected_records) / 1024
-            size_str = f"{round(total_kb / 1024, 2)} MB" if total_kb >= 1024 else f"{round(total_kb, 1)} KB"
-            st.markdown(f"<div style='padding-top: 6px; font-weight: 700; color: #1e40af;'>📌 Selected: {len(selected_files)} of {downloaded_count} documents ({size_str})</div>", unsafe_allow_html=True)
+            progress_bar = st.progress(0.0)
+            downloader.crawl(progress_bar=progress_bar)
+            progress_bar.progress(1.0)
+            status_box.update(label="✅ Extraction & Metadata Parsing Complete!", state="complete", expanded=False)
+
+            downloaded_count = sum(1 for r in downloader.records if r.status == "Downloaded")
+            failed_count = sum(1 for r in downloader.records if r.status == "Failed")
+
+            # Suggest default folder name based on URL path or fallback
+            path_name = PurePosixPath(urlparse(url).path).stem
+            default_folder = safe_folder_name(path_name) if path_name and len(path_name) > 3 else "harvested_pdfs"
+            st.session_state["bundle_folder_name"] = default_folder
+
+            # Initialize all downloaded files to Keep = True
+            st.session_state["selected_filenames"] = {
+                f: True for f, _, _ in downloader.downloaded_files
+            }
+            st.session_state["editor_version"] = 0
+
+            # Save harvest records in session_state
+            st.session_state["raw_harvest"] = {
+                "visited_count": len(downloader.visited),
+                "downloaded_count": downloaded_count,
+                "failed_count": failed_count,
+                "downloaded_files": downloader.downloaded_files,
+                "records": downloader.records,
+            }
+
+    # 4. PERSISTENT RESULTS & SELECTION CONTROLS (Survives button clicks and app reruns)
+    if st.session_state.get("raw_harvest"):
+        temp_dir_str = st.session_state.get("session_temp_dir")
+        # If container rebooted and wiped /tmp, reset stale session gracefully without crashing
+        if not temp_dir_str or not Path(temp_dir_str).exists():
+            st.session_state["raw_harvest"] = None
+            st.session_state["session_temp_dir"] = None
+            st.session_state["cached_zip_key"] = None
+            st.rerun()
+        harvest = st.session_state["raw_harvest"]
+        downloaded_count = harvest["downloaded_count"]
+        failed_count = harvest["failed_count"]
+        visited_count = harvest["visited_count"]
+        downloaded_files = harvest["downloaded_files"]
+        records = harvest["records"]
+
+        # Metric KPI Cards
+        mcol1, mcol2, mcol3 = st.columns(3)
+        with mcol1:
+            st.markdown(
+                f"""
+                <div style="background: #e0f2fe; border-radius: 10px; padding: 12px; border-left: 5px solid #0284c7;">
+                    <div style="font-size: 11px; font-weight: 700; color: #0369a1;">PAGES EXPLORED</div>
+                    <div style="font-size: 24px; font-weight: 800; color: #0c4a6e;">{visited_count}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with mcol2:
+            st.markdown(
+                f"""
+                <div style="background: #dcfce7; border-radius: 10px; padding: 12px; border-left: 5px solid #16a34a;">
+                    <div style="font-size: 11px; font-weight: 700; color: #15803d;">PDFs HARVESTED</div>
+                    <div style="font-size: 24px; font-weight: 800; color: #14532d;">{downloaded_count}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with mcol3:
+            st.markdown(
+                f"""
+                <div style="background: #fee2e2; border-radius: 10px; padding: 12px; border-left: 5px solid #dc2626;">
+                    <div style="font-size: 11px; font-weight: 700; color: #b91c1c;">DOWNLOAD ERRORS</div>
+                    <div style="font-size: 24px; font-weight: 800; color: #991b1b;">{failed_count}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
         st.write("")
 
-        # 3. Stream ZIP directly from disk without consuming RAM
-        if selected_files:
-            cache_key = (clean_name, tuple(sorted(kept_filenames)))
-            zip_file_path = Path(st.session_state["session_temp_dir"]) / f"{clean_name}.zip"
+        if downloaded_count > 0:
+            st.markdown("### 📦 Bundle Customization & Document Selection")
 
-            # Rebuild on disk ONLY if the selection or folder name changed
-            if st.session_state.get("cached_zip_key") != cache_key or not zip_file_path.exists():
-                build_zip_on_disk(selected_files, selected_records, zip_file_path, folder_name=clean_name)
-                st.session_state["cached_zip_key"] = cache_key
-                gc.collect()
-
-            # Stream directly from disk using file binary reader
-            with open(zip_file_path, "rb") as zip_stream:
-                st.download_button(
-                    label=f"📥 Download {len(selected_files)} Selected PDFs + Metadata (ZIP • {size_str})",
-                    data=zip_stream,
-                    file_name=f"{clean_name}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True,
-                    key="download_harvested_zip_btn",
+            # 1. Ask for folder name after execution
+            f_col1, f_col2 = st.columns([2, 1])
+            with f_col1:
+                custom_folder = st.text_input(
+                    "📁 Custom Folder & Archive Name:",
+                    value=st.session_state.get("bundle_folder_name", "harvested_pdfs"),
+                    help="Name of the exported ZIP and root directory containing your PDFs and metadata.csv",
+                    key="input_bundle_name",
                 )
+                st.session_state["bundle_folder_name"] = custom_folder
+            with f_col2:
+                clean_name = safe_folder_name(custom_folder)
+                st.caption("Archive Layout Preview:")
+                st.code(f"{clean_name}.zip\n  ├── {clean_name}/PDFs/...\n  └── {clean_name}/metadata.csv", language="text")
+
+            # 2. Select All / Deselect All controls
+            sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
+            with sel_col1:
+                if st.button("✅ Select All", use_container_width=True):
+                    for f, _, _ in downloaded_files:
+                        st.session_state["selected_filenames"][f] = True
+                    st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+                    st.rerun()
+            with sel_col2:
+                if st.button("❌ Deselect All", use_container_width=True):
+                    for f, _, _ in downloaded_files:
+                        st.session_state["selected_filenames"][f] = False
+                    st.session_state["editor_version"] = st.session_state.get("editor_version", 0) + 1
+                    st.rerun()
+
+            # Prepare DataFrame for interactive keep/ignore selection
+            doc_list = []
+            for rec in records:
+                if rec.status == "Downloaded":
+                    is_kept = st.session_state["selected_filenames"].get(rec.filename, True)
+                    doc_list.append({
+                        "Keep": is_kept,
+                        "Document Title": rec.title,
+                        "File Name": rec.filename,
+                        "Size (KB)": round(rec.size_bytes / 1024, 1),
+                        "Issue Date": rec.date or "—",
+                        "Publisher / Source": rec.publisher or "—",
+                    })
+
+            editor_key = f"manifest_editor_{st.session_state.get('editor_version', 0)}"
+            table_data = pd.DataFrame(doc_list) if HAS_PANDAS else doc_list
+            edited_df = st.data_editor(
+                table_data,
+                column_config={
+                    "Keep": st.column_config.CheckboxColumn("Keep", default=True, help="Check to include in ZIP bundle"),
+                },
+                disabled=["Document Title", "File Name", "Size (KB)", "Issue Date", "Publisher / Source"],
+                hide_index=True,
+                use_container_width=True,
+                key=editor_key,
+            )
+
+            # Sync user checkbox edits back to session state safely
+            if HAS_PANDAS and hasattr(edited_df, "to_dict"):
+                table_rows = edited_df.to_dict(orient="records")
+            elif isinstance(edited_df, list):
+                table_rows = edited_df
+            else:
+                table_rows = doc_list
+
+            kept_filenames = {r["File Name"] for r in table_rows if r.get("Keep", True)}
+            for f, _, _ in downloaded_files:
+                st.session_state["selected_filenames"][f] = (f in kept_filenames)
+
+            # Filter selected files & records
+            selected_files = [f for f in downloaded_files if f[0] in kept_filenames]
+            selected_records = [r for r in records if r.filename in kept_filenames]
+
+            with sel_col3:
+                total_kb = sum(r.size_bytes for r in selected_records) / 1024
+                size_str = f"{round(total_kb / 1024, 2)} MB" if total_kb >= 1024 else f"{round(total_kb, 1)} KB"
+                st.markdown(f"<div style='padding-top: 6px; font-weight: 700; color: #1e40af;'>📌 Selected: {len(selected_files)} of {downloaded_count} documents ({size_str})</div>", unsafe_allow_html=True)
+
+            st.write("")
+
+            # 3. Stream ZIP directly from disk without consuming RAM
+            if selected_files:
+                cache_key = (clean_name, tuple(sorted(kept_filenames)))
+                zip_file_path = Path(st.session_state["session_temp_dir"]) / f"{clean_name}.zip"
+
+                # Rebuild on disk ONLY if the selection or folder name changed
+                if st.session_state.get("cached_zip_key") != cache_key or not zip_file_path.exists():
+                    build_zip_on_disk(selected_files, selected_records, zip_file_path, folder_name=clean_name)
+                    st.session_state["cached_zip_key"] = cache_key
+                    gc.collect()
+
+                # Stream directly from disk using file binary reader
+                with open(zip_file_path, "rb") as zip_stream:
+                    st.download_button(
+                        label=f"📥 Download {len(selected_files)} Selected PDFs + Metadata (ZIP • {size_str})",
+                        data=zip_stream,
+                        file_name=f"{clean_name}.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True,
+                        key="download_harvested_zip_btn",
+                    )
+            else:
+                st.warning("⚠️ No documents selected. Please check at least one document to enable ZIP download.")
         else:
-            st.warning("⚠️ No documents selected. Please check at least one document to enable ZIP download.")
-    else:
-        st.info("No PDF documents were found at the provided URL.")
-# 5. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
-tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
-with tcol1:
+            st.info("No PDF documents were found at the provided URL.")
+    # 5. COMPACT 5 SMALL COLORFUL BOXES (Placed below the search and result area)
+    tcol1, tcol2, tcol3, tcol4, tcol5 = st.columns(5)
+    with tcol1:
+        st.markdown(
+            """
+            <div class="compact-tile tile-blue">
+                <span class="tile-icon">🌐</span>
+                <div class="tile-text-wrap">
+                    <div class="tile-title">Auto Engine</div>
+                    <div class="tile-desc">DSpace / Web</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with tcol2:
+        st.markdown(
+            """
+            <div class="compact-tile tile-green">
+                <span class="tile-icon">🌿</span>
+                <div class="tile-text-wrap">
+                    <div class="tile-title">Deep Crawl</div>
+                    <div class="tile-desc">Sublink Recursion</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with tcol3:
+        st.markdown(
+            """
+            <div class="compact-tile tile-orange">
+                <span class="tile-icon">⚡</span>
+                <div class="tile-text-wrap">
+                    <div class="tile-title">Live Stream</div>
+                    <div class="tile-desc">Memory Safe</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with tcol4:
+        st.markdown(
+            """
+            <div class="compact-tile tile-purple">
+                <span class="tile-icon">📚</span>
+                <div class="tile-text-wrap">
+                    <div class="tile-title">Metadata</div>
+                    <div class="tile-desc">Title • Author • Date</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with tcol5:
+        st.markdown(
+            """
+            <div class="compact-tile tile-teal">
+                <span class="tile-icon">📦</span>
+                <div class="tile-text-wrap">
+                    <div class="tile-title">ZIP Export</div>
+                    <div class="tile-desc">1-Click Bundle</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # 5. Footer Banner
     st.markdown(
         """
-        <div class="compact-tile tile-blue">
-            <span class="tile-icon">🌐</span>
-            <div class="tile-text-wrap">
-                <div class="tile-title">Auto Engine</div>
-                <div class="tile-desc">DSpace / Web</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with tcol2:
-    st.markdown(
-        """
-        <div class="compact-tile tile-green">
-            <span class="tile-icon">🌿</span>
-            <div class="tile-text-wrap">
-                <div class="tile-title">Deep Crawl</div>
-                <div class="tile-desc">Sublink Recursion</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with tcol3:
-    st.markdown(
-        """
-        <div class="compact-tile tile-orange">
-            <span class="tile-icon">⚡</span>
-            <div class="tile-text-wrap">
-                <div class="tile-title">Live Stream</div>
-                <div class="tile-desc">Memory Safe</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with tcol4:
-    st.markdown(
-        """
-        <div class="compact-tile tile-purple">
-            <span class="tile-icon">📚</span>
-            <div class="tile-text-wrap">
-                <div class="tile-title">Metadata</div>
-                <div class="tile-desc">Title • Author • Date</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with tcol5:
-    st.markdown(
-        """
-        <div class="compact-tile tile-teal">
-            <span class="tile-icon">📦</span>
-            <div class="tile-text-wrap">
-                <div class="tile-title">ZIP Export</div>
-                <div class="tile-desc">1-Click Bundle</div>
-            </div>
+        <div class="omni-footer">
+            Knowledge Today... Success Tomorrow...
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# 5. Footer Banner
-st.markdown(
-    """
-    <div class="omni-footer">
-        Knowledge Today... Success Tomorrow...
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def run_cli():
+    import argparse
+    parser = argparse.ArgumentParser(description="Universal Bulk PDF Harvester (CLI Mode)")
+    parser.add_argument("url", nargs="?", default="", help="Target URL to crawl (eGyanKosh, WBJEEB, WBCSC, etc.)")
+    parser.add_argument("--max-pages", type=int, default=150, help="Maximum pages to crawl (default: 150)")
+    parser.add_argument("--delay", type=float, default=0.5, help="Delay between requests in seconds")
+    parser.add_argument("--output-dir", default="harvested_pdfs", help="Output directory for downloaded PDFs")
+    args = parser.parse_args()
+
+    url = args.url.strip()
+    if not url:
+        try:
+            url = input("\n🔗 Enter Target URL to Harvest: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            sys.exit(0)
+
+    if not url:
+        print("❌ Error: No URL provided.")
+        sys.exit(1)
+
+    url = url.strip('"\'')
+    if not urlparse(url).scheme:
+        url = "https://" + url
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 60)
+    print("🚀 Universal Bulk Document & PDF Harvester (CLI Mode)")
+    print(f"🔗 Target: {url}")
+    print(f"📁 Output: {out_dir.resolve()}")
+    print("=" * 60 + "\n")
+
+    downloader = WebDownloader(
+        start_url=url,
+        delay=args.delay,
+        max_pages=args.max_pages,
+        max_depth=5,
+    )
+    downloader.temp_dir = out_dir
+    downloader.log = lambda msg: print("  " + re.sub(r"[*`#_]", "", msg))
+
+    downloader.crawl()
+
+    downloaded = [r for r in downloader.records if r.status == "Downloaded"]
+    print("\n" + "=" * 60)
+    print(f"✅ Crawl Complete! Downloaded {len(downloaded)} PDF document(s).")
+    print(f"📁 Saved to: {out_dir.resolve()}")
+    print("=" * 60 + "\n")
+
+    csv_path = out_dir / "metadata.csv"
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "title", "authors", "date", "publisher", "subject",
+            "description", "language", "item_type", "page_url",
+            "pdf_url", "filename", "size_bytes", "status", "error"
+        ])
+        writer.writeheader()
+        for rec in downloader.records:
+            writer.writerow(rec.__dict__)
+    print(f"📄 Metadata written to: {csv_path.name}")
+
+
+if __name__ == "__main__":
+    if RUNNING_IN_STREAMLIT:
+        render_streamlit_ui()
+    else:
+        run_cli()
